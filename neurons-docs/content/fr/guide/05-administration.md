@@ -99,26 +99,79 @@ Une fois configuré, un script unique ({{< mono "deploy-neurons-apm.sh" >}}) pre
 
 ## Sauvegarde et restauration {#backup}
 
-L'ensemble des données de Neurons réside dans une seule base Vertica, appelée « Data Lake ». Protéger cette base unique, c'est protéger l'ensemble du système — il n'existe aucune autre copie ailleurs.
+Neurons conserve ses données à trois endroits. Ils n'ont pas le même rôle, et seuls deux d'entre eux doivent être sauvegardés :
+
+| Stockage | Ce qu'il contient | À sauvegarder ? |
+|---|---|---|
+| **Vertica** (le « Data Lake ») | Toute la télémétrie : traces, logs, événements navigateur, replays de session, résumés pré-calculés utilisés par les tableaux de bord, points de reprise des workers, historique des alertes et incidents. | **Oui — critique.** C'est la seule copie de votre historique. |
+| **PostgreSQL** | La configuration : utilisateurs et accès, réglages, applications, règles de santé et politiques de notification, applications navigateur et leurs champs métier, et la base Vertica utilisée par la plateforme. | **Oui — petite mais critique.** Sans elle, la plateforme ne fonctionne pas correctement, même avec un Vertica intact. |
+| **Kafka** (mode Kafka uniquement) | Les dernières heures de trafic entrant, avant leur écriture dans Vertica. | Non — c'est une zone tampon temporaire. Elle aide en revanche après une restauration (voir plus bas). |
+
+Les images des applications et la base de géolocalisation (GeoIP) sont reconstruites à chaque déploiement et n'ont pas besoin de sauvegarde.
 
 ### Ce qu'il faut savoir avant de faire confiance à une sauvegarde
 
-- **Les données « en vol » ne sont pas couvertes.** La télémétrie reçue mais pas encore écrite en base est perdue si le service d'ingestion s'arrête brutalement.
-- **Le point de restauration est celui de la dernière sauvegarde réussie.** Tout ce qui a été ingéré entre la dernière sauvegarde et l'incident est définitivement perdu.
+- **Le point de restauration est celui de la dernière sauvegarde réussie.** Choisissez la fréquence selon la quantité de données que vous pouvez vous permettre de perdre : une fois par nuit est un bon défaut, toutes les 4 à 6 heures si vous avez besoin de plus.
+- **Sauvegardez les deux bases au même moment** (dans la même fenêtre de maintenance), pour que la configuration corresponde aux données.
+- **Mode direct :** tout ce qui a été ingéré après la dernière sauvegarde Vertica est perdu, ainsi que les quelques secondes encore en mémoire si le service d'ingestion s'arrête brutalement.
+- **Mode Kafka :** les données ingérées après la sauvegarde Vertica sont encore dans Kafka pendant sa durée de rétention (24 h par défaut). La position du loader dans la file est enregistrée *dans* Vertica : après une restauration, il reprend donc automatiquement à la position de la sauvegarde et recharge ce qui est arrivé ensuite. Les données plus anciennes que la rétention Kafka sont perdues.
+- **Gardez les sauvegardes hors de la machine.** Trois destinations sont possibles pour Vertica : un stockage objet compatible S3 (recommandé en production), un partage réseau NFS ou un disque local — les sauvegardes locales doivent alors être copiées sur une autre machine, sinon elles ne protègent pas contre la perte du serveur.
 
-Trois types de destination sont pris en charge : un stockage objet compatible S3 (recommandé en production), un partage réseau NFS, ou un disque local.
+### Mettre en place les sauvegardes
 
-### Procédure de restauration, résumée
+**Vertica** se sauvegarde avec `vbr`, l'outil de sauvegarde de Vertica, depuis le serveur Vertica :
 
-1. Évaluer l'ampleur des dégâts — en cas de doute, traiter comme une perte totale.
-2. Arrêter le service d'ingestion et tous les workers de fond avant toute restauration.
-3. Restaurer la dernière sauvegarde valide (ou une sauvegarde nommée spécifique).
-4. Valider la base restaurée avant de rouvrir le trafic.
-5. Redémarrer le service d'ingestion et les workers — chacun reprend automatiquement là où son point de reprise l'indique.
-6. Reconstruire, si possible, ce qui peut l'être pour la période perdue (graphe de dépendance, registre des transactions métier).
-7. Communiquer clairement la fenêtre de temps affectée.
+```bash
+vbr --setupconfig                          # une fois
+vbr -t backup -c backup_config.ini         # une sauvegarde (à planifier)
+vbr -t listbackup -c backup_config.ini     # lister les sauvegardes
+```
+
+Dans la configuration générée, `restorePointLimit` fixe le nombre de sauvegardes conservées (par exemple `14` pour deux semaines de sauvegardes nocturnes).
+
+**PostgreSQL** se sauvegarde avec `pg_dump`. En production, un CronJob Kubernetes (`postgres-backup`) le lance chaque nuit à 02h30 (heure de Paris), vérifie que le fichier n'est pas vide et qu'il est lisible, et garde 7 jours de sauvegardes sur son propre volume. Ce volume est sur le même serveur que la base : copiez aussi ses fichiers sur une autre machine.
+
+{{< callout type="warn" >}}
+Assurez-vous que quelqu'un est prévenu quand une sauvegarde échoue ou quand la dernière est trop ancienne (par exemple plus de 26 heures pour une sauvegarde nocturne). Le découvrir pendant un incident, c'est trop tard.
+{{< /callout >}}
+
+### Procédure de restauration
+
+1. **Évaluer les dégâts.** Dommage partiel (une table, une période) ou perte totale ? En cas de doute, considérez qu'il s'agit d'une perte totale.
+2. **Arrêter tout ce qui écrit :** le service d'ingestion, le loader (mode Kafka) et tous les workers. Dans Kubernetes :
+
+   ```bash
+   kubectl -n <namespace> scale deployment apm-ingest apm-loader apm-worker \
+     apm-trace-graph-worker apm-canonicalization-worker --replicas=0
+   ```
+
+3. **Restaurer PostgreSQL d'abord** — la plateforme en a besoin pour trouver sa base Vertica :
+
+   ```bash
+   gunzip -c neurones-<date>.sql.gz | psql -h <hôte> -U <utilisateur> -d <base>
+   ```
+
+4. **Restaurer Vertica** à partir de la dernière sauvegarde valide (ou d'une sauvegarde nommée) :
+
+   ```bash
+   vbr -t restore -c backup_config.ini --archive <nom-de-la-sauvegarde>
+   ```
+
+5. **Vérifier les versions.** Les bases restaurées doivent correspondre à la version de Neurons déployée : la dernière migration Vertica (`SELECT version FROM apm.flyway_schema_history ORDER BY installed_rank DESC LIMIT 1;`) et la migration PostgreSQL (`alembic current` dans le backend). Si la sauvegarde est plus ancienne que la version déployée, lancez les migrations avant de redémarrer.
+6. **Valider les données** avant de rouvrir le trafic :
+
+   ```sql
+   SELECT MAX(start_time) FROM apm.spans;
+   SELECT MAX(start_time) FROM apm.rum_events;
+   SELECT worker_name, checkpoint_name, last_bucket_time FROM apm.worker_checkpoints ORDER BY 1, 2;
+   ```
+
+   Les heures les plus récentes indiquent exactement où s'arrête la sauvegarde.
+7. **Redémarrer** le service d'ingestion, le loader et les workers (`--replicas` remis à leurs valeurs habituelles). Chaque worker reprend à son propre point de reprise. En mode Kafka, suivez le rattrapage du loader sur ce que Kafka contient encore.
+8. **Reconstruire** ce qui peut l'être pour la période manquante, si les données brutes existent : la carte des dépendances entre services et le registre des transactions métier.
+9. **Communiquer** la période exacte qui manque, pour que personne ne confonde des données absentes avec une période calme.
 {.steps}
 
 {{< callout type="warn" >}}
-Une sauvegarde qui n'a jamais été restaurée n'est pas une sauvegarde vérifiée. Une restauration de test mensuelle, et un exercice complet au moins une fois par an, sont recommandés.
+Une sauvegarde qui n'a jamais été restaurée n'est pas une sauvegarde vérifiée. Restaurez les dernières sauvegardes dans un environnement de test chaque mois, et faites un exercice complet et chronométré au moins une fois par an — il vous donne un vrai temps de restauration au lieu d'un temps supposé.
 {{< /callout >}}

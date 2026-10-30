@@ -101,26 +101,79 @@ Once configured, a single script ({{< mono "deploy-neurons-apm.sh" >}}) handles 
 
 ## Backup and Restore {#backup}
 
-All of Neurons's data lives in a single Vertica database, called the "Data Lake". Protecting this one database means protecting the entire system — no other copy exists anywhere else.
+Neurons keeps its data in three places. They don't play the same role, and only two of them need a backup:
+
+| Store | What it holds | Back it up? |
+|---|---|---|
+| **Vertica** (the "Data Lake") | All telemetry: traces, logs, browser events, session replays, the pre-computed summaries behind the dashboards, the workers' progress markers, alerting and incident history. | **Yes — critical.** It is the only copy of your history. |
+| **PostgreSQL** | The configuration: users and access, settings, applications, health rules and notification policies, browser applications and their business fields, and which Vertica database the platform uses. | **Yes — small but critical.** Without it the platform doesn't work correctly, even with an intact Vertica. |
+| **Kafka** (Kafka mode only) | The last hours of incoming traffic, before it is written to Vertica. | No — it is a temporary buffer. It does help after a restore (see below). |
+
+The application images and the location database (GeoIP) are rebuilt with each deployment and don't need a backup.
 
 ### What to know before trusting a backup
 
-- **Data "in flight" isn't covered.** Telemetry received but not yet written to the database is lost if the ingestion service stops abruptly.
-- **The restore point is that of the last successful backup.** Anything ingested between the last backup and the incident is permanently lost.
+- **The restore point is the last successful backup.** Plan the frequency around how much data you can afford to lose: nightly is a reasonable default, every 4 to 6 hours if you need more.
+- **Back up both databases at the same moment** (within the same maintenance window), so that the configuration matches the data.
+- **Direct mode:** anything ingested after the last Vertica backup is lost, and so are the few seconds of data still in memory if the ingestion service stops abruptly.
+- **Kafka mode:** data ingested after the Vertica backup is still in Kafka for its retention period (24 h by default). The loader's position in the queue is saved *inside* Vertica, so after a restore it automatically resumes from the backup's position and reloads what came after. Data older than the Kafka retention is lost.
+- **Keep backups off the machine.** Three destinations are supported for Vertica: S3-compatible object storage (recommended in production), an NFS network share, or local disk — local backups must then be copied to another machine, otherwise they don't protect against losing the server.
 
-Three destination types are supported: S3-compatible object storage (recommended in production), an NFS network share, or local disk.
+### Setting up the backups
 
-### Restore procedure, in brief
+**Vertica** is backed up with `vbr`, Vertica's backup tool, from the Vertica server:
 
-1. Assess the extent of the damage — when in doubt, treat it as total loss.
-2. Stop the ingestion service and all background workers before restoring anything.
-3. Restore the last valid backup (or a specific named backup).
-4. Validate the restored database before reopening traffic.
-5. Restart the ingestion service and the workers — each automatically resumes from its own checkpoint.
-6. Rebuild whatever can be rebuilt for the lost period (dependency graph, business transaction registry).
-7. Clearly communicate the affected time window.
+```bash
+vbr --setupconfig                          # once
+vbr -t backup -c backup_config.ini         # a backup (to schedule)
+vbr -t listbackup -c backup_config.ini     # list the backups
+```
+
+In the generated configuration, `restorePointLimit` sets how many backups are kept (for example `14` for two weeks of nightly backups).
+
+**PostgreSQL** is backed up with `pg_dump`. In production a Kubernetes CronJob (`postgres-backup`) runs it every night at 02:30 (Paris time), checks that the file is not empty and is readable, and keeps 7 days of backups on its own volume. That volume is on the same server as the database: copy its files to another machine as well.
+
+{{< callout type="warn" >}}
+Make sure someone is warned when a backup fails or when the latest one is too old (for example more than 26 hours for a nightly backup). Discovering it during an incident is too late.
+{{< /callout >}}
+
+### Restore procedure
+
+1. **Assess the damage.** Partial damage (one table, one time range) or total loss? When in doubt, treat it as total loss.
+2. **Stop everything that writes:** the ingestion service, the loader (Kafka mode) and all the workers. In Kubernetes:
+
+   ```bash
+   kubectl -n <namespace> scale deployment apm-ingest apm-loader apm-worker \
+     apm-trace-graph-worker apm-canonicalization-worker --replicas=0
+   ```
+
+3. **Restore PostgreSQL first** — the platform needs it to find its Vertica database:
+
+   ```bash
+   gunzip -c neurones-<date>.sql.gz | psql -h <host> -U <user> -d <database>
+   ```
+
+4. **Restore Vertica** from the last valid backup (or a named one):
+
+   ```bash
+   vbr -t restore -c backup_config.ini --archive <backup-name>
+   ```
+
+5. **Check the versions.** The restored databases must match the version of Neurons that is deployed: the last Vertica migration (`SELECT version FROM apm.flyway_schema_history ORDER BY installed_rank DESC LIMIT 1;`) and the PostgreSQL migration (`alembic current` in the backend). If the backup is older than the deployed version, run the migrations before restarting.
+6. **Validate the data** before reopening the traffic:
+
+   ```sql
+   SELECT MAX(start_time) FROM apm.spans;
+   SELECT MAX(start_time) FROM apm.rum_events;
+   SELECT worker_name, checkpoint_name, last_bucket_time FROM apm.worker_checkpoints ORDER BY 1, 2;
+   ```
+
+   The most recent times tell you exactly where the backup stops.
+7. **Restart** the ingestion service, the loader and the workers (`--replicas` back to their usual values). Each worker resumes from its own progress marker. In Kafka mode, watch the loader catch up on what Kafka still holds.
+8. **Rebuild** what can be rebuilt for the missing period, if the raw data exists: the service dependency graph and the business transaction registry.
+9. **Communicate** the exact time window that is missing, so nobody mistakes missing data for a quiet period.
 {.steps}
 
 {{< callout type="warn" >}}
-A backup that has never been restored is not a verified backup. A monthly test restore, and a full drill at least once a year, are recommended.
+A backup that has never been restored is not a verified backup. Restore the latest backups into a test environment every month, and run a complete, timed drill at least once a year — it gives you a real recovery time instead of an assumed one.
 {{< /callout >}}
