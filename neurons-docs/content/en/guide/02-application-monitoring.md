@@ -37,6 +37,15 @@ The "Traces" screen lets you search and inspect individual requests rather than 
 
 This is the screen to use to understand precisely why a given request was slow or failed: you see the exact sequence of steps, their individual duration, and where the time was actually spent.
 
+### Database calls in a trace
+
+Each database call appears in the span waterfall with a database icon, named by its operation and table (for example `SELECT orders`). Click it to open its details:
+
+- **The full SQL query**, with a button to copy it. Long queries are folded: *Show the full query* displays all of it.
+- **Three charts for this query** over the selected time window, counting every call of the same query in that service (values differ, the query is the same): **Number of calls**, **Total time** and **Average time**.
+
+If no SQL query appears, the application doesn't send it yet: see [Capturing SQL queries](#otel).
+
 ## Business Transactions {#bt}
 
 A business transaction is a named, tracked-over-time application entry point — for example "Login", "Product search", or "Checkout". Unlike services, business transactions aren't declared manually: they are automatically detected by a background job that spots recurring traffic patterns, then registered in a catalog.

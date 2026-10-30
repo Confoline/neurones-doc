@@ -54,6 +54,39 @@ An automatic purge runs once a day and applies the settings configured for each 
 
 For an application to appear in Neurons, it must be instrumented with OpenTelemetry and configured to export its traces and logs to the Collector. This section covers a common point of attention once basic instrumentation is in place: capturing HTTP headers and, more rarely, request/response bodies.
 
+### Capturing SQL queries
+
+Every database call made by an instrumented application becomes a span in its trace. To see **the SQL query itself** in Neurons — and its statistics — the instrumentation must send the query text with the span. Neurons reads it from the `db.statement` attribute or, with recent OpenTelemetry versions, from `db.query.text`; both work.
+
+Most instrumentations send the query by default. Check your language:
+
+| Language | Query sent by default? | What to configure |
+|---|---|---|
+| **Java** (OpenTelemetry Java agent) | Yes. Values are replaced by `?` (sanitized). | Nothing (keep sanitizing on: see below). |
+| **.NET** (automatic instrumentation) | **No** for SQL Server and Entity Framework Core. | Turn it on (see below). Npgsql (PostgreSQL) sends it by default. |
+| **Python** (SQLAlchemy, psycopg, mysqlclient, PyMySQL…) | Yes. | Nothing. |
+| **Node.js** (`pg`, `mysql2`, `mysql`…) | Yes. Parameter values are not sent. | Nothing. |
+| **PHP** (PDO automatic instrumentation) | Yes. | Nothing — the PDO instrumentation package must be installed (see the PHP onboarding guide). |
+
+**.NET** — add these environment variables to the application, then restart it:
+
+```bash
+OTEL_DOTNET_AUTO_SQLCLIENT_SET_DBSTATEMENT_FOR_TEXT=true             # SQL Server (SqlClient)
+OTEL_DOTNET_AUTO_ENTITYFRAMEWORKCORE_SET_DBSTATEMENT_FOR_TEXT=true   # Entity Framework Core
+```
+
+**Java** — sanitizing is on by default; don't turn it off:
+
+```bash
+OTEL_INSTRUMENTATION_COMMON_DB_STATEMENT_SANITIZER_ENABLED=true      # default: values replaced by ?
+```
+
+To check: open a trace that queries the database, then click one of its database lines (database icon). The panel on the right must show the **SQL query**.
+
+{{< callout type="warn" >}}
+The query text can contain personal data when values are written into the SQL instead of being passed as parameters (`WHERE email = 'jane@example.com'`). Prefer parameterized queries (`WHERE email = ?`), and keep sanitizing enabled where the instrumentation offers it.
+{{< /callout >}}
+
 ### Capturing HTTP headers
 
 For security, OpenTelemetry captures no HTTP headers by default — headers frequently contain sensitive information (tokens, session cookies). Capture must be explicitly enabled, separately for inbound and outbound requests, and separately for the request and the response. This is done via environment variables for most backend languages; on the browser side, the same explicit list is declared in the instrumentation's JavaScript configuration.

@@ -37,6 +37,15 @@ L'écran « Traces » permet de rechercher et d'inspecter des requêtes individu
 
 C'est l'écran à utiliser pour comprendre précisément pourquoi une requête donnée a été lente ou a échoué : on y voit l'enchaînement exact des étapes, leur durée individuelle, et où le temps a réellement été consommé.
 
+### Appels à la base de données dans une trace
+
+Chaque appel à une base de données apparaît dans la cascade des spans avec une icône de base de données, nommé par son opération et sa table (par exemple `SELECT orders`). Cliquez dessus pour ouvrir son détail :
+
+- **La requête SQL complète**, avec un bouton pour la copier. Les longues requêtes sont repliées : *Show the full query* l'affiche en entier.
+- **Trois graphiques pour cette requête** sur la période sélectionnée, en comptant tous les appels de la même requête dans ce service (les valeurs changent, la requête est la même) : **nombre d'appels**, **temps total** et **temps moyen**.
+
+Si aucune requête SQL n'apparaît, l'application ne l'envoie pas encore : voir [Capture des requêtes SQL](#otel).
+
 ## Transactions métier (Business Transactions) {#bt}
 
 Une transaction métier est un point d'entrée applicatif nommé et suivi dans la durée — par exemple « Connexion », « Recherche produit » ou « Paiement ». Contrairement aux services, les transactions métier ne sont pas déclarées manuellement : elles sont détectées automatiquement par une tâche de fond qui repère les schémas de trafic récurrents, puis inscrites dans un registre.

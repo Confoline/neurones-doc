@@ -52,6 +52,39 @@ Une purge automatique passe une fois par jour et applique les réglages configur
 
 Pour qu'une application apparaisse dans Neurons, elle doit être instrumentée avec OpenTelemetry et configurée pour exporter ses traces et logs vers le Collecteur. Ce paragraphe couvre un point d'attention fréquent une fois l'instrumentation de base en place : la capture des en-têtes HTTP et, plus rarement, du contenu des requêtes/réponses.
 
+### Capture des requêtes SQL
+
+Chaque appel à une base de données fait par une application instrumentée devient un span dans sa trace. Pour voir **la requête SQL elle-même** dans Neurons — et ses statistiques — l'instrumentation doit envoyer le texte de la requête avec le span. Neurons le lit dans l'attribut `db.statement` ou, avec les versions récentes d'OpenTelemetry, dans `db.query.text` ; les deux fonctionnent.
+
+La plupart des instrumentations envoient la requête par défaut. Vérifiez votre langage :
+
+| Langage | Requête envoyée par défaut ? | Ce qu'il faut configurer |
+|---|---|---|
+| **Java** (agent Java OpenTelemetry) | Oui. Les valeurs sont remplacées par `?` (nettoyage). | Rien (gardez le nettoyage activé : voir plus bas). |
+| **.NET** (instrumentation automatique) | **Non** pour SQL Server et Entity Framework Core. | L'activer (voir plus bas). Npgsql (PostgreSQL) l'envoie par défaut. |
+| **Python** (SQLAlchemy, psycopg, mysqlclient, PyMySQL…) | Oui. | Rien. |
+| **Node.js** (`pg`, `mysql2`, `mysql`…) | Oui. Les valeurs des paramètres ne sont pas envoyées. | Rien. |
+| **PHP** (instrumentation automatique PDO) | Oui. | Rien — le paquet d'instrumentation PDO doit être installé (voir le guide d'intégration PHP). |
+
+**.NET** — ajoutez ces variables d'environnement à l'application, puis redémarrez-la :
+
+```bash
+OTEL_DOTNET_AUTO_SQLCLIENT_SET_DBSTATEMENT_FOR_TEXT=true             # SQL Server (SqlClient)
+OTEL_DOTNET_AUTO_ENTITYFRAMEWORKCORE_SET_DBSTATEMENT_FOR_TEXT=true   # Entity Framework Core
+```
+
+**Java** — le nettoyage est activé par défaut ; ne le désactivez pas :
+
+```bash
+OTEL_INSTRUMENTATION_COMMON_DB_STATEMENT_SANITIZER_ENABLED=true      # par défaut : valeurs remplacées par ?
+```
+
+Pour vérifier : ouvrez une trace qui interroge la base, puis cliquez sur l'une de ses lignes de base de données (icône de base de données). Le panneau de droite doit afficher la **requête SQL**.
+
+{{< callout type="warn" >}}
+Le texte de la requête peut contenir des données personnelles quand les valeurs sont écrites dans le SQL au lieu d'être passées en paramètres (`WHERE email = 'jane@example.com'`). Préférez les requêtes paramétrées (`WHERE email = ?`), et gardez le nettoyage activé quand l'instrumentation le propose.
+{{< /callout >}}
+
 ### Capture des en-têtes HTTP
 
 Par sécurité, OpenTelemetry ne capture aucun en-tête HTTP par défaut — les en-têtes contiennent fréquemment des informations sensibles (jetons, cookies de session). La capture doit être explicitement activée, séparément pour les requêtes entrantes et sortantes, et séparément pour la requête et la réponse. Cela se fait par variables d'environnement pour la plupart des langages backend ; côté navigateur, la même liste explicite est déclarée dans la configuration JavaScript de l'instrumentation.
