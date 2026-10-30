@@ -119,6 +119,7 @@ main[tabindex="-1"]:focus{outline:none}
 .part-eyebrow::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--grad)}
 .content h2{font-family:var(--brandfont);font-size:26px;line-height:1.3;font-weight:700;letter-spacing:-.015em;color:var(--heading);margin:36px 0 12px}
 .content h3{font-family:var(--brandfont);font-size:19px;line-height:1.35;font-weight:700;color:var(--heading);margin:28px 0 8px}
+.content h4{font-family:var(--brandfont);font-size:16.5px;line-height:1.4;font-weight:700;color:var(--heading);margin:24px 0 8px}
 .content p{margin:0 0 16px}
 .content ul,.content ol{margin:0 0 18px;padding-left:24px}
 .content li{margin:4px 0}

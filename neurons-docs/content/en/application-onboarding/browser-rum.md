@@ -1,22 +1,22 @@
 ---
 title: Browser RUM Onboarding
 linkTitle: Browser RUM
-lede: Instrument a web frontend with OpenTelemetry browser instrumentation so Neurons shows what real users experience — page views, Web Vitals, frontend errors, sessions, frustration signals, and the backend traces behind each page.
+lede: Add the Neurons RUM script to your websites so Neurons shows what real users experience — page views, Web Vitals, frontend errors, sessions, frustration signals, business fields, and the backend traces behind each page.
 menus:
   onboarding:
     parent: application-onboarding
     weight: 2
 labels:
-  add-sdk: Add browser instrumentation
-  implement: Implement browser telemetry
-  telemetry: Browser telemetry
-  configure: Configure Neurons
-  replay: Session replay
-  identity: Application & frontend identity
+  install: Install the script
+  enable: Enable the site
+  configure: Configure the application
+  identity: Application identity
   test-traffic: Generate test traffic
   verify: Verify in Neurons
   security: Security & privacy
+  troubleshooting: Troubleshooting
   rollback: Disable / rollback
+  custom-otel: Custom OpenTelemetry instrumentation
 ---
 
 ## Overview {#overview}
@@ -30,41 +30,334 @@ Browser Real User Monitoring (RUM) measures what users actually experience in th
 | Frontend errors | JavaScript errors raised in users' browsers, grouped by message. |
 | Sessions | Each user's visit as a chronological journey across pages, and the most common page-to-page paths. |
 | User actions and frustration signals | Rage clicks, dead clicks and error clicks — signs of a degraded experience even without a visible technical error. |
+| Business fields | Values such as the user, order, cart or product, read from the page and attached to every page view and API call. |
 | Browser, device and location | Breakdowns by browser, operating system, device type and country. |
 | Correlation with the backend | For each page, the backend business transactions it triggers, and for each trace, the browser and backend spans together. |
 {firstcol="26"}
 
 RUM is **independent of backend onboarding**: an application can have backend tracing without RUM, or both. Enabling or disabling RUM never changes the backend configuration. Correlation with backend traces requires the backend to be instrumented too — see the [PHP](../php/), [Java](../java/), [.NET](../dotnet/) and [Python](../python/) guides.
 
+**How it works in short:** you add **one script line** to your pages. Everything else — what is collected, on which sites, with which business fields — is set in Neurons, under **APM → Browser apps**, without touching the site again.
+
 ## Architecture {#architecture}
 
 {{< flow label="How browser telemetry reaches Neurons" >}}
-app | Browser | The user's browser loads your web application
+app | Your website | Loads the Neurons RUM script with your company key
+→ `GET /rum/config/<company key>`
+platform | Neurons — RUM configuration | Finds the application for the site's domain (or lists a new site as waiting for approval) and returns its settings
+→ OTLP over HTTP (JSON), `?app_id=`, no token
+platform | Neurons — public browser intake | Accepts data only from the application's domains, applies rate limits, resolves the visitor's location
 →
-app | OpenTelemetry browser instrumentation | Runs in the page: records page views, Web Vitals, errors, API calls and user actions
-→ OTLP over HTTP (JSON), same origin
-app | RUM ingestion endpoint | A route on your web server or reverse proxy that adds the Neurons token and the visitor's IP address
-→ OTLP over HTTP (JSON) + `X-Neurones-Token`
-platform | Neurons | The ingestion service recognizes browser telemetry, resolves geolocation and stores it
-→
-platform | Browser Performance / RUM | Page loads, Web Vitals, errors, sessions, frustration, frontend ↔ backend traces
+platform | Browser Performance / RUM | Page loads, Web Vitals, errors, sessions, frustration, business fields, frontend ↔ backend traces
 {{< /flow >}}
 
-- Browser instrumentation exports **OTLP/HTTP JSON**, which the Neurons ingestion service accepts directly: unlike backend agents, browser telemetry does not need to go through the OpenTelemetry Collector.
-- The **RUM ingestion endpoint** is what the browser calls. It keeps the Neurons token out of the browser and passes on the visitor's IP address — see [Configure Neurons](#configure).
-- **Trace correlation:** the browser instrumentation adds the W3C `traceparent` header to the application's API calls, so a user action and the backend work it triggers are recorded in the same distributed trace.
+- **No token in the browser, no forwarding route to build.** The script carries only your **company key**, which is public by design. What protects your data is the list of **domains** of each application: Neurons refuses browser data from any other site.
+- **New sites wait for approval.** The first time the script loads on a new site, Neurons lists it under **Waiting for approval**. Nothing it sends is stored until an administrator enables it.
+- **Settings are live.** The script re-reads its settings regularly (every 5 minutes by default), so a change in Neurons reaches visitors without redeploying the site.
+- **Trace correlation:** the script adds the W3C `traceparent` header to the calls made to your API, so a user action and the backend work it triggers are recorded in the same distributed trace.
 
 ## Prerequisites {#prerequisites}
 
-- A web frontend whose JavaScript entry point you can change, rebuild and redeploy.
-- A web server or reverse proxy **on the same origin** as the frontend, able to forward requests and add a header (nginx, Apache, IIS, an API gateway, or a backend route).
-- The Neurons ingestion token, provided by the Neurons platform team and held **server-side only** — plus the query token if session replay is in scope.
-- The Neurons ingestion service URL for the target environment.
-- The `application` name, the frontend `service.name` and the deployment environment, agreed with the backend services (see [Application and Frontend Identity](#identity)).
-- An explicit decision on optional features: session replay, user identification, browser log export.
+- Access to the HTML `<head>` of the site's pages — the page template, the tag manager, or the reverse proxy in front of the site.
+- An account on Neurons. Any logged-in user can view **Browser apps**; enabling sites and changing their settings requires an **administrator**.
+- If your site has a **Content Security Policy**, permission to add the Neurons address to `script-src` and `connect-src` — or to serve the script from your own domain (see [Serve the script from your own domain](#own-domain)).
+- The `application` name and environment used by the backend services, so the frontend and its backend are grouped together (see [Application identity](#identity)).
+- An explicit decision on optional features: session replay, user name, business fields that contain personal data.
 
-## Add Browser Instrumentation {#add-sdk}
+## Install the script {#install}
 
+### Copy the snippet
+
+1. In Neurons, open **APM → Browser apps**.
+2. Scroll to **Your RUM script** and click **Copy snippet**. It looks like this:
+
+   ```html
+   <script src="https://<NEURONS_ADDRESS>/rum/v1/sdk.js" data-app-key="<COMPANY_KEY>" async></script>
+   ```
+
+3. Add this line to the `<head>` of **every page** of the site — in the page layout or template, so it is on all pages.
+4. Deploy the site.
+{.steps}
+
+- **The same line for every site of your company.** You do not create the application first: Neurons recognizes each site by its domain when the script loads.
+- **Single-page applications:** add it to the `index.html` that loads the application. Route changes are detected automatically.
+- **Tag managers** (for example Google Tag Manager): a *Custom HTML* tag firing on all pages works, but the first page views of a visit may be measured later than with the line in the HTML.
+- `<NEURONS_ADDRESS>` is the public address of Neurons configured by the platform team (`RUM_PUBLIC_BASE_URL`). If it is not configured, the snippet uses the address you opened Neurons with — check that your visitors can reach it.
+
+{{< callout >}}
+The script never breaks the page: if Neurons cannot be reached, if the site is not enabled, or if the browser blocks it, the page keeps working and nothing is sent.
+{{< /callout >}}
+
+### Serve the script from your own domain {#own-domain}
+
+Optional. Serving the script through your own site avoids ad-blockers and keeps your Content Security Policy unchanged:
+
+1. On your web server or reverse proxy, forward every request under `/neurons-rum/` to `<NEURONS_ADDRESS>/`.
+2. Load the script from `/neurons-rum/rum/v1/sdk.js` instead of the Neurons address. The script then sends its data to the same `/neurons-rum/` path.
+{.steps}
+
+Example with nginx:
+
+```nginx
+location /neurons-rum/ {
+    proxy_pass         https://<NEURONS_ADDRESS>/;
+    proxy_set_header   Host              <NEURONS_ADDRESS>;
+    proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_ssl_server_name on;
+}
+```
+
+```html
+<script src="/neurons-rum/rum/v1/sdk.js" data-app-key="<COMPANY_KEY>" async></script>
+```
+
+{{< callout type="warn" >}}
+**Visitor location behind your proxy.** Neurons believes `X-Forwarded-For` only from proxies it trusts. Give the platform team the outgoing IP addresses of your proxy so they are added to the trusted list (`TRUSTED_PROXY_CIDRS`); otherwise every visitor is located at your proxy.
+{{< /callout >}}
+
+## Enable the site {#enable}
+
+### Review and enable
+
+1. Open a page of the site in a browser, so the script loads once.
+2. In **APM → Browser apps**, the site appears under **Waiting for approval**, with its domain and how many times the script has loaded.
+3. Click **Review and enable**.
+4. Check the **General** settings — the name and environment are guessed from the domain (for example `staging` for `staging.shop.example.com`). Correct them so they match the backend (see [Application identity](#identity)).
+5. Review **Data collection**, and optionally [record a scenario](#business-fields) to choose business fields.
+6. Click **Enable RUM on &lt;application&gt;**.
+{.steps}
+
+Visitors start sending data **within a few minutes**. Until then — and for every site that is not enabled — the script loads but nothing is stored.
+
+Only an administrator can enable, disable or ignore a site. Use **Ignore** for a site that must never be monitored (a developer's machine, a partner's copy of a page): it is hidden from the list and its data is refused. **Show ignored sites → Review again** brings it back.
+
+### What happens to new sites
+
+Under **Your RUM script → New sites**, an administrator chooses:
+
+| Option | Effect |
+|---|---|
+| Wait for approval (default) | A new site is listed under **Waiting for approval**; nothing is collected until it is enabled. |
+| Start right away | A new site is enabled at once with the default settings: standard RUM only — session replay and business fields stay off until you turn them on. |
+{firstcol="26"}
+
+At most 200 sites can wait for approval at the same time; beyond that, new sites are not listed until some are enabled, ignored or deleted.
+
+### Application statuses
+
+| Status | Script on the site | Data |
+|---|---|---|
+| Waiting for approval | Loads, collects nothing | Not stored |
+| Active | Collects according to the settings | Stored |
+| Disabled | Loads, collects nothing | Not stored |
+| Ignored | Loads, collects nothing | Refused; the site is hidden from the list |
+{firstcol="26"}
+
+### Domains
+
+An application accepts data **only from its domains**. Under **General → Domains** you can:
+
+- **Add a domain**: an exact host (`www.shop.example.com`), a host with a port (`shop.example.com:8443`), or a wildcard covering every subdomain (`*.shop.example.com`).
+- **Merge** another detected site: adding the domain of a site already listed as another application asks for confirmation, then moves it into this one — for example `shop.example.com` and `www.shop.example.com`.
+- **Remove a domain**: an application keeps at least one.
+
+## Configure the application {#configure}
+
+Click **Settings** next to an application. Changes are applied when you click **Save changes** (or **Enable RUM** for a site waiting for approval), and reach visitors within the configuration refresh delay — 5 minutes by default.
+
+### General
+
+| Setting | Use |
+|---|---|
+| Application name | Groups the frontend with its backend services — use the **same `application` value as the backend**. |
+| Environment | `production`, `preprod`, `staging` or `development` — the same value as the backend. |
+| Service name | Identifies this frontend in Browser Performance, for example `shop-web`. |
+| Domains | The sites the application accepts data from — see [Domains](#enable). |
+{firstcol="26"}
+
+### Data collection
+
+| Module | Collects | Default |
+|---|---|---|
+| Page views and load times | Full loads and in-app navigation, with timings | On |
+| Web vitals | LCP, INP, CLS, FCP, TTFB | On |
+| API calls | Calls made by the page, linked to backend traces | On |
+| JavaScript errors | Uncaught errors and failed promises | On |
+| Frustration signals | Rage clicks, dead clicks, clicks followed by an error | On |
+| User name | The logged-in user's name — personal data. The user id is always allowed. | Off |
+{firstcol="26"}
+
+**Visits monitored** (default 100%) is the share of visits the script follows. Lower it to reduce the volume of data on very busy sites; a visit is either fully monitored or not at all.
+
+### Business fields {#business-fields}
+
+Business fields add values such as `user.id`, `order.id`, `cart.total` or `product.sku` to **every page view and API call** of a visit, so you can filter and break down the experience by customer, order or product. They are shown in the trace detail and sent as `biz.<name>` attributes.
+
+There are three ways to add them, under **Business fields**:
+
+**1. Suggested from your visitors.** Once RUM is enabled, the script reports the **names** of the fields a page exposes — never their values. After 20 visits (every visit is used at first, then 1 in 10), Neurons suggests the useful ones; click **Enable** on those you want. A field must be seen in at least 3 visits to be suggested. An enabled field that visits have not shown for 7 days is flagged: the site may have changed.
+
+**2. Record a scenario.** Click **Record a scenario**, choose the site and the start page, then **Open my site and record**:
+
+1. Neurons opens your site in a new tab, with a one-time link valid 15 minutes.
+2. Use the site as a visitor would: log in, browse, add to cart, buy.
+3. Back in Neurons, choose the fields to keep, name them and set their privacy.
+{.steps}
+
+Recording works even while the site waits for approval, but the site must already load the script, and only the tab Neurons opened is recorded.
+
+**3. Add manually.** Click **Add manually** and choose where the value is read from:
+
+| Read from | You give | Example |
+|---|---|---|
+| Server response | The API URL (and method), then the field in the JSON response | `/api/carts/:id` → `total` |
+| dataLayer event | The event name, then the field in the event | `purchase` → `ecommerce.transaction_id` |
+| Page data (schema.org) | The schema.org type and field | `Product.sku` |
+| On screen | The element's CSS selector | `.cart-summary .total` |
+| Cookie, Local storage, Session storage | The name or key (and a field inside a JSON value) | `profile` → `tier` |
+| Login token (JWT claim) | Where the token is, then the claim | `local_storage:token` → `sub` |
+| Meta tag | The meta tag name | `shop:country` |
+| Page address | The URL parameter | `utm_source` |
+| JavaScript variable | The variable path | `shopState.cart.count` |
+| Click | The clicked element's CSS selector (and an attribute) | `.add-to-cart` → `data-sku` |
+{firstcol="30"}
+
+For each field you also choose:
+
+- **Only on pages** (optional): a page pattern such as `/checkout/*`.
+- **Keep for**: *the whole visit* (for example the user) or *the current page* (for example the product being viewed).
+- **Privacy**: *Automatic* hashes names that look personal (email, phone, name, address…) and keeps the others; or force *Keep the value*, *Mask* (first character only) or *Hash*.
+
+{{< callout >}}
+Passwords, card numbers, tokens and other secrets are **never collected**, whatever a rule says: fields whose name looks like a secret cannot become a business field, and the script refuses values that look like a card number.
+{{< /callout >}}
+
+### API calls
+
+| Setting | Use |
+|---|---|
+| Your API domains | Calls to these origins count as your own API. Calls to the site's own domain always count. |
+| API path prefixes | Paths that identify API calls on the site's domain. Default: `/api`. |
+| Link to backend traces on | Origins that receive the `traceparent` header, so the browser action and the backend trace are joined. Same-domain calls always get it. |
+| Request / response headers to capture | Up to 20 header names each, shown on the API call. Neurons suggests the names seen on your API calls. |
+| Body capture | Per route and method: capture the request and/or response body, redacted and cut to a size limit of 1 to 16 KB. |
+{firstcol="30"}
+
+{{< callout type="warn" >}}
+Add an origin to **Link to backend traces on** only if that API's CORS configuration allows the `traceparent` request header — otherwise the browser blocks the calls. Never captured, whatever the settings: `Authorization`, `Cookie`, `Set-Cookie`, and any header whose name contains *token*, *secret*, *key*, *auth* or *session*.
+{{< /callout >}}
+
+### Session replay {#replay}
+
+{{< callout type="warn" >}}
+**Session replay is off by default and not part of standard onboarding.** It records what visitors see so a session can be replayed. Applications handling credentials, financial or legal data, identity documents or other sensitive information require a privacy review before it is turned on.
+{{< /callout >}}
+
+When turned on:
+
+- **Sessions recorded** (default 10%) — the share of monitored visits that are recorded.
+- **Mask all page text** (default on) — replaces every text of the page; turn it off only after the privacy review.
+- Form inputs are **always masked**.
+
+### Advanced
+
+| Setting | Use |
+|---|---|
+| Route patterns | One per line, for example `/products/:slug`. URLs are grouped by these patterns; other URLs are grouped automatically. |
+| Name of your API in the service map | The node the browser calls point to. Default: `<application>-api`. |
+| Application type | `spa` (single-page application) or `web`. |
+| Wait for consent | Nothing starts before the visitor accepts (GDPR). Give the consent cookie and the text it must contain once accepted, for example `cookie_consent` containing `analytics`. |
+{firstcol="30"}
+
+**Delete application** (administrators) removes its settings and business fields. Data already collected stays in Neurons. If the script is still on the site, the site reappears under **Waiting for approval** on its next visit.
+
+## Application identity {#identity}
+
+Two values identify browser telemetry, at two levels:
+
+- **Service name identifies the frontend.** Browser Performance lists and filters frontends by service name.
+- **Application name groups services.** The same application name on the frontend and on its backend services groups them under one logical application.
+
+```text
+Frontend (Browser apps):  application = shop   service name = shop-web   environment = production
+Backend (OpenTelemetry):  application = shop   service.name = shop-api   deployment.environment = production
+```
+
+Neurons stamps these values on everything the script sends, so a page can never write into another application's data.
+
+## Generate test traffic {#test-traffic}
+
+After enabling the site:
+
+1. Open the site from a real browser and do a full page reload.
+2. Navigate between pages (route changes, for an SPA).
+3. Perform an action that calls the backend.
+4. Trigger a controlled JavaScript error.
+5. Click the same spot three times quickly, to produce a rage click.
+{.steps}
+
+Telemetry is sent in batches: allow a few seconds before checking Neurons.
+
+## Verify in Neurons {#verify}
+
+1. In **APM → Browser apps**, the application is **Active** and its *Page views, 24 h* increase.
+2. In the browser's developer tools (Network), the requests to `/v1/traces` return **2xx** — a 403 means the domain is missing from the application (see [Troubleshooting](#troubleshooting)).
+3. The frontend appears in **Browser Performance** under its service name.
+4. Page views arrive, for the full reload and for route changes.
+5. Web Vitals arrive with their ratings, and the Apdex is calculated.
+6. The controlled JavaScript error appears.
+7. Sessions show the pages visited, in order.
+8. Browser, OS and device are populated, and the location matches the visitor — not a server.
+9. The backend call appears in the same trace as the browser action, and the page lists the business transactions it triggers.
+10. If configured: business fields appear in the trace detail; frustration signals and session replay appear.
+{.steps}
+
+{{< callout >}}
+An onboarding is not complete until it has been validated on the deployed environment, not only locally.
+{{< /callout >}}
+
+## Security & privacy {#security}
+
+- **The company key is public by design** — it is in every page. It only lets a site *ask* to be monitored; data is stored only from the domains of an **enabled** application, and Neurons applies rate limits per application and per visitor.
+- **No Neurons token is ever needed in the browser.** Never put an ingestion or query token in frontend code.
+- Passwords, card numbers, tokens and secrets are never collected; sensitive headers are never captured; captured bodies are redacted.
+- Business fields whose names look personal are **hashed** unless you choose otherwise; **User name** is off by default.
+- Field discovery sends field **names**, never values.
+- Use **Wait for consent** where the visitor's consent is required before measuring.
+- Review the collection of visitor IP addresses and locations against the application's privacy requirements.
+- Session replay stays off unless approved after a privacy review.
+
+## Troubleshooting {#troubleshooting}
+
+| Symptom | Likely cause | Action |
+|---|---|---|
+| The site never appears under **Waiting for approval** | The script is not on the page, is blocked (ad-blocker, Content Security Policy), or the Neurons address is not reachable from the browser | Check the page source and the browser console; add the Neurons address to the CSP or [serve the script from your own domain](#own-domain). |
+| The site does not appear, and other sites already wait | 200 sites already wait for approval | Enable, ignore or delete waiting sites. |
+| `/v1/traces` returns **403** | The page's domain is not one of the application's domains | Add the domain, or merge the site into the application. |
+| `/v1/traces` returns **202** and nothing appears | The application is not enabled (waiting, disabled or ignored) | Enable RUM on the application. |
+| `/v1/traces` returns **429** | Rate limit reached for the application or the visitor | Lower **Visits monitored**; ask the platform team if the limits are too low for the site's traffic. |
+| Enabled, but no data after several minutes | Pages opened before enabling keep the old settings until their next refresh | Reload the page; wait up to the configuration refresh delay (5 minutes by default). |
+| Two applications for one site | The site is reachable on several domains (`shop.` and `www.shop.`) | Add one domain to the other application to merge them. |
+| API calls fail with a CORS error after enabling | An API origin is in **Link to backend traces on** but its CORS does not allow `traceparent` | Allow the header on the API, or remove the origin. |
+| Browser and backend spans in separate traces | The API origin is not in **Link to backend traces on**, or the backend is not instrumented | Add the origin (with CORS), and onboard the backend. |
+| No business field suggestion | Learning not finished (fewer than 20 visits), or RUM not enabled | Wait for more visits, or record a scenario. |
+| A business field is flagged "not seen by recent visits" | The page or API changed | Check the rule's selector, URL or path. |
+| Every visitor located in the same place | The script is served through your proxy and its address is not trusted | Ask the platform team to add your proxy's outgoing addresses to `TRUSTED_PROXY_CIDRS`. |
+| Users metric empty | No user id business field, or a long time range | Add a `user.id` business field; use a shorter range. |
+
+## Disable / rollback {#rollback}
+
+RUM can be stopped without touching the site or backend tracing:
+
+1. In **Browser apps → Settings**, click **Disable RUM**. Within a few minutes the script stops collecting; data already collected stays in Neurons.
+2. To stop loading the script at all, remove the script line from the site and redeploy it.
+3. If you served the script from your own domain, remove the `/neurons-rum/` route.
+4. Confirm that no new browser telemetry arrives in Neurons, and that backend traces continue normally.
+{.steps}
+
+## Custom OpenTelemetry instrumentation {#custom-otel}
+
+**Most sites do not need this section.** It is for frontends that already use their own OpenTelemetry browser instrumentation, or that cannot load the Neurons script. You then build the telemetry yourself, following the contract below, and send it to Neurons through a forwarding route that adds the ingestion token. Applications instrumented this way are not listed in **Browser apps** and are not configured there.
 ### Install the packages
 
 ```bash
@@ -143,10 +436,10 @@ if (RUM_ENDPOINT) {
 }
 ```
 
-## Implement Neurons Browser Telemetry {#implement}
+### Implement Neurons browser telemetry {#implement}
 
 {{< callout type="warn" >}}
-**The initialization above is not enough to populate Browser Performance.** The standard OpenTelemetry Web SDK creates generic spans (document load, `fetch` calls). It does not create the Neurons-specific browser telemetry described in the next section. Neurons does not currently ship an official browser library: these signals must currently be implemented by the integrating application, following the contract below.
+**The initialization above is not enough to populate Browser Performance.** The standard OpenTelemetry Web SDK creates generic spans (document load, `fetch` calls). It does not create the Neurons-specific browser telemetry described below — the Neurons RUM script does. With your own instrumentation, these signals must be implemented by the application, following the contract below.
 {{< /callout >}}
 
 The application must implement:
@@ -162,11 +455,11 @@ The application must implement:
 | Frustration signals | Detect rage, dead and error clicks and record them as spans with `frustration.type`. |
 {firstcol="26"}
 
-## Browser Telemetry Expected by Neurons {#telemetry}
+### Browser telemetry expected by Neurons {#telemetry}
 
 Neurons fills the Browser Performance screens from specific span names and attributes. A wrong name is not rejected — the data is simply missing from the screens.
 
-### Page views
+#### Page views
 
 | Item | Contract |
 |---|---|
@@ -182,7 +475,7 @@ Neurons fills the Browser Performance screens from specific span names and attri
 - When `pl.total_ms` is absent, the span duration is used.
 - Business Journey steps of type `rum_page` are counted from `page-view` spans and their `page.path` — see [Business Journeys](../../#bj).
 
-### Page-load timings {#page-load-timings}
+#### Page-load timings {#page-load-timings}
 
 All values are milliseconds.
 
@@ -212,12 +505,14 @@ Instead of computed `pl.*` values, a hard `page-view` span may carry the raw bro
 | responseStart − requestStart | pl.request_ms |
 | responseEnd − responseStart | pl.response_download_ms |
 | responseStart | pl.ttfb_ms |
-| domInteractive, domContentLoadedEventEnd, domComplete | pl.dom_interactive_ms, pl.dom_content_loaded_ms, pl.dom_complete_ms |
+| domInteractive | pl.dom_interactive_ms |
+| domContentLoadedEventEnd | pl.dom_content_loaded_ms |
+| domComplete | pl.dom_complete_ms |
 | domComplete − responseEnd | pl.dom_processing_ms |
 | loadEventEnd − loadEventStart | pl.load_event_ms |
 {mono="1,2"}
 
-### Web Vitals and Apdex
+#### Web Vitals and Apdex
 
 | Item | Contract |
 |---|---|
@@ -248,14 +543,14 @@ FCP and TTFB are displayed as Web Vitals but do not contribute to Apdex. Thresho
 | TTFB | ≤ 800 ms | ≤ 1800 ms | > 1800 ms | No |
 {mono="1"}
 
-### API calls
+#### API calls
 
 - Only **CLIENT** spans (the `fetch`/XHR spans) count as browser API calls.
 - A CLIENT span is classified as an **API call** when it carries `api.kind` (or an explicit `rum.kind=api-call`).
 - A CLIENT span with a URL or route but no API classification is treated as a **resource call**.
 - The route shown is resolved from `api.route`, then `url.path`, then `http.route`, then `http.target`. Set a normalized `api.route` (identifiers replaced, e.g. `/api/orders/:id`) so calls group correctly.
 
-### Browser errors
+#### Browser errors
 
 A browser span is counted as a JavaScript error **only when it carries `rum.kind=app-error`**:
 
@@ -272,9 +567,9 @@ A browser span is counted as a JavaScript error **only when it carries `rum.kind
 | page.path | Page where the error occurred |
 {firstcol="26" mono="1"}
 
-Errors can also be sent as **OTLP log records**: a log record is counted as a browser error when it carries `rum.kind=js-error` or `rum.kind=app-error`, with the same `error.*` attributes. This requires a `/v1/logs` forwarding route — see [Configure Neurons](#configure).
+Errors can also be sent as **OTLP log records**: a log record is counted as a browser error when it carries `rum.kind=js-error` or `rum.kind=app-error`, with the same `error.*` attributes. This requires a `/v1/logs` forwarding route — see [Forwarding route](#forwarding-route).
 
-### Frustration signals
+#### Frustration signals
 
 | Attribute | Content |
 |---|---|
@@ -285,29 +580,52 @@ Errors can also be sent as **OTLP log records**: a log record is counted as a br
 | session.id | Required — signals without it are not recorded |
 {firstcol="26" mono="1"}
 
-### Sessions and users
+#### Sessions and users
 
 - `session.id` is **required** for sessions, journeys, replay and frustration signals. Neurons groups telemetry by the value it receives: the application decides the scope (for example one identifier per browser tab, kept in `sessionStorage`).
 - The session timeline looks back up to 30 days.
 - The **Users** metric counts distinct `user.id` values (or `user.name` when `user.id` is absent) on page views. Without user identification it stays empty. Sessions and Users are not available on long time ranges served from aggregated data.
 - `user.id` and `user.name` are personal data — see [Security & privacy](#security).
 
-## Configure Neurons {#configure}
+### Forwarding route {#forwarding-route}
 
-### Configure the Browser RUM Ingestion Endpoint
+**Why this is needed.** The browser cannot send telemetry straight to Neurons: Neurons requires a token, and anything placed in browser code is visible to every visitor. So the browser sends its telemetry to **your own website**, and your web server passes it on to Neurons, adding the token on the way:
 
-Expose the ingestion paths on the frontend's own origin and forward them to the Neurons ingestion service. The forwarding route adds the token, so no credential is ever sent to the browser.
+```text
+Browser ──POST https://shop.example.com/v1/traces──▶ Your web server ──adds token + visitor IP──▶ Neurons
+         (no token, same website)                    (forwarding route)
+```
 
-| Path called by the browser | Forward to | Headers the route must add |
+You add this forwarding route once, on the web server or reverse proxy that already serves the frontend.
+
+#### Step 1 — Decide which routes you need
+
+| Route on your website | Needed when | Token to add |
 |---|---|---|
-| /v1/traces | `<NEURONES_INGEST_URL>/v1/traces` | `X-Neurones-Token: <ingestion token>`, `X-Forwarded-For`, `X-Real-IP` |
-| /v1/logs — only if browser errors are sent as logs | `<NEURONES_INGEST_URL>/v1/logs` | `X-Neurones-Token: <ingestion token>`, `X-Forwarded-For`, `X-Real-IP` |
-| /rum/replay — only if session replay is enabled | `<NEURONES_INGEST_URL>/rum/replay` | `X-Neurones-Token: <query token>`, `X-Forwarded-For`, `X-Real-IP` |
+| /v1/traces | **Always** | Ingestion token |
+| /v1/logs | Only if the application sends JavaScript errors as log records | Ingestion token |
+| /rum/replay | Only if session replay is approved | Ingestion token |
 {firstcol="26" mono="1"}
 
-Example with nginx (placeholders to replace; keep the token out of version control, for example by substituting it from the server environment at startup):
+Most applications only need `/v1/traces`.
+
+#### Step 2 — Get the values from the Neurons platform team
+
+- `<NEURONES_INGEST_URL>` — the address of the Neurons ingestion service for your environment.
+- The **ingestion token** — the same token for every route.
+
+#### Step 3 — Add the forwarding routes to your web server
+
+Each route does three things:
+
+1. **Forward** the request to the same path on `<NEURONES_INGEST_URL>`.
+2. **Add the token** in the `X-Neurones-Token` header.
+3. **Pass on the visitor's IP address** in `X-Forwarded-For` and `X-Real-IP` — Neurons uses it for the visitor's country and city.
+
+Example with nginx (replace the values in angle brackets; keep the token out of version control, for example by injecting them from the server environment at startup):
 
 ```nginx
+# Always
 location /v1/traces {
     proxy_pass         <NEURONES_INGEST_URL>/v1/traces;
     proxy_set_header   Host              $host;
@@ -315,27 +633,61 @@ location /v1/traces {
     proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
     proxy_set_header   X-Neurones-Token  <NEURONES_INGEST_TOKEN>;
 }
+
+# Only if JavaScript errors are sent as log records
+location /v1/logs {
+    proxy_pass         <NEURONES_INGEST_URL>/v1/logs;
+    proxy_set_header   Host              $host;
+    proxy_set_header   X-Real-IP         $remote_addr;
+    proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header   X-Neurones-Token  <NEURONES_INGEST_TOKEN>;
+}
+
+# Only if session replay is approved
+location /rum/replay {
+    proxy_pass         <NEURONES_INGEST_URL>/rum/replay;
+    proxy_set_header   Host              $host;
+    proxy_set_header   X-Real-IP         $remote_addr;
+    proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header   X-Neurones-Token  <NEURONES_INGEST_TOKEN>;
+}
 ```
 
-A `/v1/logs` route, when used, is configured the same way with the ingestion token.
+With another web server (Apache, IIS, an API gateway) or a route in your backend application, apply the same three rules.
 
-{{< callout type="warn" >}}
-**Traces and session replay use different tokens.** In the current Neurons contract, `/v1/traces` and `/v1/logs` are authenticated with the **ingestion** token and `/rum/replay` with the **query** token. If the replay route is given the ingestion token, replay uploads are rejected with 401 unless the two tokens are equal in your environment. Confirm both values with the Neurons platform team.
+#### Step 4 — Test the route
+
+From any machine, send an empty trace export to **your website** (not to Neurons). Nothing is stored:
+
+```bash
+curl -i -X POST https://<YOUR_FRONTEND_HOST>/v1/traces \
+  -H "Content-Type: application/json" \
+  -d '{"resourceSpans":[]}'
+```
+
+| Response | Meaning |
+|---|---|
+| 200 | The route works and the token is accepted. |
+| 401 | The route reaches Neurons, but the token is missing or wrong. |
+| 404 | The route is not configured on your web server. |
+| 502 / 504 | Your web server cannot reach `<NEURONES_INGEST_URL>`. |
+{firstcol="26"}
+
+#### Step 5 — Point the browser instrumentation at the route
+
+Use the same-origin path as the exporter URL: `/v1/traces` (as in the initialization example above). The browser never needs the Neurons address or any token.
+
+{{< callout >}}
+The forwarding route is needed only for custom instrumentation. The Neurons RUM script sends its data directly to Neurons, without a token — see [Install the script](#install).
 {{< /callout >}}
 
-If the Neurons platform team provides a RUM endpoint that the browser can call directly without a token, it can replace the forwarding route. In that case geolocation reflects whatever connects to the ingestion service, not necessarily the visitor.
+#### Geolocation
 
-### Geolocation
+There is no client-side geolocation. Neurons resolves country, region, city and coordinates from the visitor's IP address and overwrites any `geo.*` attribute sent by the browser. `X-Forwarded-For` and `X-Real-IP` are believed only when the request comes from a proxy Neurons trusts (`TRUSTED_PROXY_CIDRS`): give the platform team the outgoing addresses of your forwarding server, otherwise every visitor is located at that server.
 
-There is no client-side geolocation. Neurons resolves country, region, city and coordinates from the first **public** IP address in `X-Forwarded-For` (then `X-Real-IP`) of the ingestion request, and overwrites any `geo.*` attribute sent by the browser. Without these headers, every visitor is located at the address of the forwarding server.
+### Session replay upload {#replay-upload}
 
-## Optional — Session Replay {#replay}
-
-{{< callout type="warn" >}}
-**Session replay is not part of standard onboarding.** It records what users see and do. Applications handling credentials, financial or legal data, identity documents or other sensitive information require a dedicated privacy and masking review before it is enabled.
-{{< /callout >}}
-
-When approved, a recorder such as `@rrweb/record` uploads batches to `/rum/replay`:
+Session replay follows the same privacy rules as with the Neurons script — see [Session replay](#replay). When approved, a recorder such as `@rrweb/record` uploads batches to `/rum/replay` (through the forwarding route, with the ingestion token):
 
 | Field | Content |
 |---|---|
@@ -352,25 +704,9 @@ Replay sessions are associated with the browser telemetry through the frontend `
 
 Unknown fields are rejected with **422**. Default size limits: 2 MiB compressed and 25 MiB decompressed per batch. Configure the recorder to mask every input value and to block elements that must never be recorded.
 
-## Application and Frontend Identity {#identity}
+### Resource and span attributes {#otel-attributes}
 
-Two attributes identify browser telemetry, at two levels:
-
-- **`service.name` identifies the frontend.** Browser Performance lists and filters frontends by `service.name`, and replay is matched on it.
-- **`application` groups services.** The same `application` value on the frontend and on its backend services groups them under one logical application; it is used for grouping and filtering, not to identify the frontend in Browser Performance.
-
-Example:
-
-```text
-Frontend:  application = shop   service.name = shop-web   deployment.environment = production
-Backend:   application = shop   service.name = shop-api   deployment.environment = production
-```
-
-The same `application` (`shop`) groups the frontend and the backend; the different `service.name` values (`shop-web`, `shop-api`) identify each service.
-
-### Resource attributes
-
-Set once, when the SDK is initialized:
+Resource attributes, set once when the SDK is initialized — `application`, `service.name` and `deployment.environment` follow the same rules as in [Application identity](#identity):
 
 | Attribute | Required | Notes |
 |---|---|---|
@@ -381,7 +717,7 @@ Set once, when the SDK is initialized:
 | app.type | No | `spa` or `mpa`. When absent, Neurons infers it from `nav.type`: any soft navigation means SPA, hard-only means MPA. |
 {firstcol="30" mono="1"}
 
-### Attributes on every span
+#### Attributes on every span
 
 Neurons reads these from each **span**, not from the resource — set them on every span the instrumentation creates or enriches:
 
@@ -393,52 +729,12 @@ Neurons reads these from each **span**, not from the resource — set them on ev
 | user.id, user.name | Optional, only after login and only if approved — personal data. `user.id` feeds the Users metric. |
 {firstcol="30" mono="1"}
 
-## Generate test traffic {#test-traffic}
-
-After deploying the instrumented frontend:
-
-1. Open the application from a real browser and do a full page reload.
-2. Navigate between pages (route changes, for an SPA).
-3. Perform an action that calls the backend.
-4. Trigger a controlled JavaScript error.
-5. Click the same spot three times quickly, to produce a rage click if frustration signals are implemented.
-{.steps}
-
-Telemetry is sent in batches: allow a few seconds before checking Neurons.
-
-## Verify in Neurons {#verify}
-
-1. In the browser's developer tools (Network), requests to the RUM ingestion endpoint return **2xx** — a 401 means the forwarding route does not add a valid token.
-2. The frontend appears in **Browser Performance** under its `service.name`.
-3. Page views arrive, for the full reload and for route changes.
-4. Web Vitals arrive with their ratings, and the Apdex is calculated.
-5. The controlled JavaScript error appears.
-6. Sessions show the pages visited, in order.
-7. Browser, OS and device are populated, and the location matches the visitor — not the server.
-8. The backend call appears in the same trace as the browser action, and the page lists the business transactions it triggers.
-9. For an SPA, route changes show Route API total, Route backend total and Data wait.
-10. If enabled: frustration signals, the Users metric and session replay appear.
-{.steps}
-
-{{< callout >}}
-An onboarding is not complete until it has been validated on the deployed environment, not only locally.
-{{< /callout >}}
-
-## Security & privacy {#security}
-
-- **Never put a Neurons token in frontend code**, nor in a build variable that ends up in the JavaScript bundle. Tokens live only on the forwarding route.
-- Never commit tokens to version control.
-- Do not capture form values, passwords, authentication tokens, payment data or `Authorization` headers.
-- `user.id` and `user.name` are personal data: send them only if approved.
-- Review the collection of visitor IP addresses and locations against the application's privacy requirements.
-- Session replay stays disabled unless approved after a privacy and masking review.
-
-## Troubleshooting {#troubleshooting}
+### Troubleshooting custom instrumentation
 
 | Symptom | Likely cause | Action |
 |---|---|---|
 | `/v1/traces` returns 401 | The forwarding route does not add the ingestion token, or adds a wrong one | Check the route's header and the token value. |
-| `/rum/replay` returns 401 while traces work | Replay is authenticated with the query token | Configure the query token on the replay route. |
+| `/rum/replay` returns 401 while traces work | The replay route adds another token than the ingestion token | Use the ingestion token on every route. |
 | `/rum/replay` returns 422 | Unknown field, wrong `content_encoding`, or batch too large | Send only the documented fields; use `gzip` or `identity`; keep batches under the limits. |
 | Replays not linked to sessions | Replay `app` differs from the frontend `service.name` | Send the frontend `service.name` as `app`. |
 | Frontend missing from Browser Performance | `telemetry.sdk.language=webjs` missing, or no `page-view` spans | Check the resource attributes and implement page views (see [Implement Neurons Browser Telemetry](#implement)). |
@@ -446,20 +742,16 @@ An onboarding is not complete until it has been validated on the deployed enviro
 | Web Vitals shown but no ratings and no Apdex | `wv.rating` missing or not exactly `good` / `needs-improvement` / `poor` | Send the rating emitted by the `web-vitals` library. |
 | API calls listed as resource calls | `api.kind` not set on the API spans | Set `api.kind` and a normalized `api.route`. |
 | Route API total / backend total / Data wait empty | API calls not in the same trace as the soft `page-view` | Keep the soft page-view span active while the route's API calls start. |
-| Every visitor located in the same place | The forwarding route does not pass the visitor IP | Add `X-Forwarded-For` / `X-Real-IP`. |
 | Sessions, replay or frustration signals empty | `session.id` missing on spans | Set `session.id` on every span. |
-| Users metric empty | No `user.id` on page views, or a long time range | Enable approved user identification; use a shorter range. |
 | Browser and backend spans in separate traces | `traceparent` not sent, or backend not instrumented | Check the Fetch instrumentation; for a cross-origin API, `propagateTraceHeaderCorsUrls` and CORS. |
 | Breakdowns show "unknown" | `browser.name` / `os.name` / `device.type` set only on the resource | Set them on each span. |
 | Frontend grouped apart from its backend | Different `application` values | Use the same `application` value on both sides. |
 | The page fails to load in production only | Unguarded RUM initialization, e.g. `crypto.randomUUID()` over HTTP | Guard ID generation; wrap each RUM feature in `try/catch`. |
 | A package is installed but has no effect | Never imported or registered (e.g. `ZoneContextManager`) | Check the RUM source, not only `package.json`. |
 
-## Disable / rollback {#rollback}
-
-RUM can be disabled without touching backend tracing:
+### Disable custom instrumentation
 
 1. Turn the RUM switch off, or remove the RUM import from the application entry point.
-2. Rebuild and redeploy the frontend — RUM is part of the JavaScript bundle, so a server-side change alone does not disable it.
-3. Optionally remove the RUM ingestion routes from the web server.
-4. Confirm that no new browser telemetry arrives in Neurons, and that backend traces continue normally.
+2. Rebuild and redeploy the frontend — custom instrumentation is part of the JavaScript bundle, so a server-side change alone does not disable it.
+3. Remove the forwarding routes from the web server.
+{.steps}
