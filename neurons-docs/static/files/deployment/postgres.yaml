@@ -32,8 +32,13 @@ spec:
         app: postgres
     spec:
       terminationGracePeriodSeconds: 60
-      # PostgreSQL runs as its own user (uid 999), never as root: as root the
-      # image changes the owner of its data folder, which NFS volumes refuse.
+      # PostgreSQL tourne directement sous son propre compte (uid 999 dans
+      # l'image officielle), jamais en root. Lance en root, l'image fait un
+      # chown du dossier de donnees : refuse sur un volume NFS (root_squash),
+      # d'ou "chown: Operation not permitted" et un CrashLoopBackOff
+      # (constate chez un client avec la StorageClass NFS cdf-nfs).
+      # En 999, pas de chown : il suffit que le dossier soit inscriptible,
+      # ce qui est le cas avec local-path comme avec NFS.
       securityContext:
         runAsUser: 999
         runAsGroup: 999
@@ -62,16 +67,35 @@ spec:
             limits:
               cpu: "2"
               memory: 2Gi
+          # Le 1er demarrage (initdb, puis creation de la base "neurones") peut
+          # durer plusieurs minutes sur un NFS lent. Sans cette sonde, la sonde
+          # de vie tuait le conteneur au milieu (vers 90 s) : au redemarrage, le
+          # dossier n'etant plus vide, l'image sautait la creation de la base
+          # ("database neurones does not exist", lab OpenText du 29/10/2026).
+          # Jusqu'a 15 minutes avant que la sonde de vie prenne le relais.
+          # -h 127.0.0.1 : le serveur provisoire de l'initialisation n'ecoute pas
+          # en TCP, la sonde ne passe donc qu'une fois la base creee.
+          startupProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres", "-h", "127.0.0.1"]
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 90
           readinessProbe:
             exec:
               command: ["pg_isready", "-U", "postgres", "-d", "neurones"]
             initialDelaySeconds: 10
             periodSeconds: 10
+            timeoutSeconds: 5
           livenessProbe:
             exec:
               command: ["pg_isready", "-U", "postgres"]
             initialDelaySeconds: 30
             periodSeconds: 20
+            # 1 s par defaut : trop court quand le NFS est lent (constate le 29/10 :
+            # "pg_isready timed out after 1s"), le conteneur serait tue sans raison.
+            timeoutSeconds: 5
+            failureThreshold: 6
   volumeClaimTemplates:
     - metadata:
         name: data

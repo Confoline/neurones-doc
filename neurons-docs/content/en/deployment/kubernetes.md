@@ -16,6 +16,7 @@ labels:
   postgres: PostgreSQL
   migrations: Database structure
   admin: Administrator
+  kafka: Kafka
   applications: Applications
   verifier: Checks
   collecteurs: Collectors
@@ -34,10 +35,18 @@ This guide deploys **Neurons** on your own server and your own Kubernetes cluste
 **On your side:**
 
 - a machine with **`kubectl`** (cluster administrator), **`vsql`** (the Vertica client), **`openssl`** and **`curl`**;
-- a Kubernetes cluster, **version 1.27 or later**, with **ingress-nginx** and a default **StorageClass**;
-- at least **1.5 CPU cores** and **3.5 GB** of free memory;
-- a **Vertica administrator** account (`dbadmin`), and the Vertica port reachable from the cluster;
-- the Neurons **domain**, and its **HTTPS certificate** with its private key (PEM files).
+- a Kubernetes cluster, **version 1.27 or later**, with **ingress-nginx** and a default **StorageClass** (Neurons creates two volumes: 10 Gi for PostgreSQL and 50 Gi for Kafka);
+- at least **3.5 CPU cores** and **8 GB** of free memory;
+- **no other Strimzi operator** (Kafka) in the cluster: this guide installs its own, version 1.2.0;
+- a **Vertica administrator** account (`dbadmin`), and the Vertica port (5433) reachable from your machine and from the cluster nodes;
+- the Neurons **domain**, and its **HTTPS certificate** with its private key (PEM files);
+- the cluster nodes must reach `quay.io` and `docker.io` over HTTPS, in addition to the Confoline registry (Kafka, PostgreSQL and Redis images).
+
+**Shared cluster:** if port 443 is already used by another application, or if an Ingress of another application already has the annotation `kubernetes.io/ingress.class: nginx`, install a separate ingress-nginx for Neurons, with its own class and a free port. You will give this class and this port at step 10:
+
+```bash
+helm install ingress-nginx ingress-nginx/ingress-nginx -n ingress-nginx --create-namespace --set controller.service.type=NodePort --set controller.service.nodePorts.https=30443 --set controller.service.nodePorts.http=30080 --set controller.ingressClassResource.name=neurons-nginx --set controller.ingressClassResource.controllerValue=k8s.io/neurons-nginx --set controller.ingressClass=neurons-nginx --set controller.ingressClassResource.default=false --set controller.admissionWebhooks.enabled=false
+```
 
 Values to replace are marked **`<TO FILL>`**.
 
@@ -45,11 +54,13 @@ Values to replace are marked **`<TO FILL>`**.
 
 | File | Content | Step |
 |---|---|---|
-| [`apm-tables.sql`](../../files/deployment/apm-tables.sql) | the `apm` schema and its 89 tables | 4 |
-| [`vertica-comptes.sql`](../../files/deployment/vertica-comptes.sql) | the two Neurons Vertica accounts and their privileges | 4 |
+| [`vertica-migrations.yaml`](../../files/deployment/vertica-migrations.yaml) | creation of the `apm` schema and its tables in Vertica | 4 |
+| [`vertica-comptes.sql`](../../files/deployment/vertica-comptes.sql) | the two Neurons Vertica accounts, their privileges and the 4 resource pools | 4 |
 | [`postgres.yaml`](../../files/deployment/postgres.yaml) | PostgreSQL | 6 |
 | [`migrations.yaml`](../../files/deployment/migrations.yaml) | creation of the PostgreSQL tables | 7 |
-| [`applications.yaml`](../../files/deployment/applications.yaml) | the 6 applications and their web routes | 9 |
+| [`strimzi.yaml`](../../files/deployment/strimzi.yaml) | the Kafka operator (Strimzi 1.2.0) | 9 |
+| [`kafka.yaml`](../../files/deployment/kafka.yaml) | the Kafka cluster and its 2 topics | 9 |
+| [`applications.yaml`](../../files/deployment/applications.yaml) | the 13 applications, their web routes and their autoscalers | 10 |
 {mono="1"}
 
 They contain no password: only placeholders (`__DOMAINE__`…) that are automatically replaced with your values at deployment time. Click a file name to view it; the command below downloads all of them to the server.
@@ -60,10 +71,10 @@ Create a working directory:
 mkdir neurons-deploiement && cd neurons-deploiement
 ```
 
-Download the 5 files:
+Download the 7 files:
 
 ```bash
-for f in apm-tables.sql vertica-comptes.sql postgres.yaml migrations.yaml applications.yaml; do curl -fsSLO "https://docs.confoline.com/neurons/files/deployment/$f"; done
+for f in vertica-migrations.yaml vertica-comptes.sql postgres.yaml migrations.yaml strimzi.yaml kafka.yaml applications.yaml; do curl -fsSLO "https://docs.confoline.com/neurons/files/deployment/$f"; done
 ```
 
 Check that they are there:
@@ -72,11 +83,11 @@ Check that they are there:
 ls
 ```
 
-Expected: `apm-tables.sql  applications.yaml  migrations.yaml  postgres.yaml  vertica-comptes.sql`
+Expected: `applications.yaml  kafka.yaml  migrations.yaml  postgres.yaml  strimzi.yaml  vertica-comptes.sql  vertica-migrations.yaml`
 
 ## Step 2 — Create the Neurons namespace {#namespace}
 
-All of Neurons will live in this namespace.
+All of Neurons will live in this namespace. Keep the name `neurons`: the deployment files use it.
 
 ```bash
 kubectl create namespace neurons
@@ -88,6 +99,20 @@ This secret is used to download the images, at installation and on every restart
 
 ```bash
 kubectl -n neurons create secret docker-registry neurones-registry --docker-server='<TO FILL: registry>' --docker-username='<TO FILL: username>' --docker-password='<TO FILL: password>'
+```
+
+The three Neurons images, from the Confoline list:
+
+```bash
+export IMAGE_BACKEND='<TO FILL: backend image>'
+```
+
+```bash
+export IMAGE_FRONTEND='<TO FILL: frontend image>'
+```
+
+```bash
+export IMAGE_APM='<TO FILL: apm-ingest image>'
 ```
 
 ## Step 4 — Prepare the Vertica database {#vertica}
@@ -112,29 +137,69 @@ read -rs -p "Password to create for neurones_reader: " LECTEUR_MDP; echo
 read -rs -p "Password to create for neurones_writer: " ECRIVAIN_MDP; echo
 ```
 
-### Create the apm schema and its 89 tables
+### Create the apm schema and its tables
 
-The `dbadmin` password is requested, on each of the three `vsql` commands of this step.
+The tables are created by the migration tool of the apm-ingest image, the same one as in production. It keeps a history (`apm.flyway_schema_history`), so later versions of Neurons only add what is missing.
+
+The tool connects with `dbadmin`. Its password goes into a temporary secret, deleted at the end of this step:
 
 ```bash
-vsql -h "$VERTICA_HOST" -d "$VERTICA_DB" -U dbadmin -f apm-tables.sql
+read -rs -p "dbadmin password: " DBADMIN_MDP; echo
 ```
 
-### Create the two Neurons accounts
+```bash
+kubectl -n neurons create secret generic vertica-admin --from-literal=VERTICA_ADMIN_PASSWORD="$DBADMIN_MDP"
+```
 
-A **reader** account and a **writer** account: Neurons never uses `dbadmin`.
+Run the migrations:
+
+```bash
+sed -e "s|__IMAGE_APM__|$IMAGE_APM|" -e "s|__VERTICA_HOST__|$VERTICA_HOST|" -e "s|__VERTICA_DB__|$VERTICA_DB|" vertica-migrations.yaml | kubectl -n neurons apply -f -
+```
+
+Wait until they finish (a few minutes):
+
+```bash
+kubectl -n neurons wait --for=condition=complete job/neurones-vertica-migrations --timeout=1800s
+```
+
+Check:
+
+```bash
+kubectl -n neurons logs job/neurones-vertica-migrations | tail -5
+```
+
+Expected: the applied migrations, and no `ERROR` line.
+
+Delete the temporary secret:
+
+```bash
+kubectl -n neurons delete secret vertica-admin
+```
+
+### Create the two accounts and the resource pools
+
+A **reader** account and a **writer** account: Neurons never uses `dbadmin`. The same file creates the 4 resource pools, which reserve part of the Vertica memory for Neurons. The `dbadmin` password is requested on each `vsql` command.
 
 ```bash
 vsql -h "$VERTICA_HOST" -d "$VERTICA_DB" -U dbadmin -v lecteur_mdp="'$LECTEUR_MDP'" -v ecrivain_mdp="'$ECRIVAIN_MDP'" -f vertica-comptes.sql
 ```
 
+If a pool already exists, Vertica answers `already exists` for that pool: it is kept as it is.
+
 ### Check
 
 ```bash
-vsql -h "$VERTICA_HOST" -d "$VERTICA_DB" -U dbadmin -c "SELECT COUNT(*) FROM v_catalog.tables WHERE table_schema = 'apm';"
+vsql -h "$VERTICA_HOST" -d "$VERTICA_DB" -U dbadmin -c "SELECT version FROM apm.flyway_schema_history WHERE success ORDER BY installed_rank DESC LIMIT 1;"
 ```
 
-Expected: **89**.
+Expected: the number of the last migration.
+
+```bash
+vsql -h "$VERTICA_HOST" -d "$VERTICA_DB" -U dbadmin -c "SELECT name FROM v_catalog.resource_pools WHERE name LIKE 'apm%';"
+```
+
+Expected: `apm_core_pool`, `apm_loader_pool`, `apm_query_pool`, `apm_worker_pool`.
 
 ## Step 5 — Create the application secrets {#secrets}
 
@@ -192,21 +257,13 @@ kubectl -n neurons create secret tls neurones-tls --cert="$CERTIFICAT" --key="$C
 kubectl -n neurons apply -f postgres.yaml
 ```
 
-Wait until it is ready:
+Wait until it is ready. On slow storage (NFS), the first start can take several minutes:
 
 ```bash
-kubectl -n neurons rollout status statefulset/postgres --timeout=300s
+kubectl -n neurons rollout status statefulset/postgres --timeout=900s
 ```
 
 ## Step 7 — Create the PostgreSQL database structure {#migrations}
-
-### The backend image
-
-```bash
-export IMAGE_BACKEND='<TO FILL: backend image from the Confoline list>'
-```
-
-### Run the migrations
 
 ```bash
 sed -e "s|__IMAGE_BACKEND__|$IMAGE_BACKEND|" -e "s|__VERTICA_HOST__|$VERTICA_HOST|" -e "s|__VERTICA_DB__|$VERTICA_DB|" migrations.yaml | kubectl -n neurons apply -f -
@@ -224,11 +281,11 @@ Check:
 kubectl -n neurons logs job/neurones-migrations | tail -2
 ```
 
-Expected: the last line shows the latest migration (`... -> 9a4f6b2e7c15`).
+Expected: the last line shows the latest migration (`... -> a3d5f7b9c1e2` with the current images).
 
 ## Step 8 — Create the administrator and the Vertica connection {#admin}
 
-{{< callout type="warn" >}}Do this **before** step 9: otherwise the application creates an incomplete Vertica connection by itself, and trace reception will not be able to write.{{< /callout >}}
+{{< callout type="warn" >}}Do this **before** step 10: otherwise the application creates an incomplete Vertica connection by itself, and trace reception will not be able to write.{{< /callout >}}
 
 ### The first Neurons administrator
 
@@ -259,35 +316,81 @@ EOF
 
 Expected: `CREATE EXTENSION`, then `INSERT 0 1` three times.
 
-## Step 9 — Deploy the Neurons applications {#applications}
+## Step 9 — Deploy Kafka {#kafka}
 
-### Your domain and the two other images
+Trace reception places every request in Kafka, and the loaders write it to Vertica. Kafka keeps 24 hours of data: nothing is lost if Vertica slows down. It must be ready before the applications.
+
+### The Kafka operator
+
+Strimzi manages Kafka in Kubernetes. It is installed in the `neurons` namespace and watches only that namespace.
+
+```bash
+kubectl apply --server-side -f strimzi.yaml
+```
+
+```bash
+kubectl -n neurons rollout status deployment/strimzi-cluster-operator --timeout=300s
+```
+
+### The Kafka cluster and its topics
+
+```bash
+kubectl -n neurons apply -f kafka.yaml
+```
+
+Wait until Kafka is ready (a few minutes, the time to create its volume):
+
+```bash
+kubectl -n neurons wait kafka/neurons-kafka --for=condition=Ready --timeout=600s
+```
+
+```bash
+kubectl -n neurons wait kafkatopic --all --for=condition=Ready --timeout=180s
+```
+
+Expected: `neurons-kafka condition met`, then the two topics `otlp.traces.raw` and `otlp.logs.raw`.
+
+## Step 10 — Deploy the Neurons applications {#applications}
+
+### Your domain and its web access
 
 ```bash
 export DOMAINE='<TO FILL: domain, e.g. neurons.your-domain.com>'
 ```
 
-```bash
-export IMAGE_FRONTEND='<TO FILL: frontend image from the Confoline list>'
-```
+The IngressClass of your ingress-nginx (`nginx` in most cases, `neurons-nginx` with the separate controller of the prerequisites):
 
 ```bash
-export IMAGE_APM='<TO FILL: apm-ingest image from the Confoline list>'
+export INGRESS_CLASS='nginx'
+```
+
+Its HTTPS port (`443`, or `30443` with the separate controller):
+
+```bash
+export HTTPS_PORT='443'
+```
+
+The Neurons address, built from these values:
+
+```bash
+if [ "$HTTPS_PORT" = 443 ]; then export ADRESSE="https://$DOMAINE"; else export ADRESSE="https://$DOMAINE:$HTTPS_PORT"; fi; echo "$ADRESSE"
 ```
 
 ### Deploy
 
 ```bash
-sed -e "s|__DOMAINE__|$DOMAINE|g" -e "s|__VERTICA_HOST__|$VERTICA_HOST|g" -e "s|__VERTICA_DB__|$VERTICA_DB|g" -e "s|__IMAGE_BACKEND__|$IMAGE_BACKEND|g" -e "s|__IMAGE_FRONTEND__|$IMAGE_FRONTEND|g" -e "s|__IMAGE_APM__|$IMAGE_APM|g" applications.yaml | kubectl -n neurons apply -f -
+sed -e "s|__DOMAINE__|$DOMAINE|g" -e "s|__ADRESSE__|$ADRESSE|g" -e "s|__INGRESS_CLASS__|$INGRESS_CLASS|g" -e "s|__VERTICA_HOST__|$VERTICA_HOST|g" -e "s|__VERTICA_DB__|$VERTICA_DB|g" -e "s|__IMAGE_BACKEND__|$IMAGE_BACKEND|g" -e "s|__IMAGE_FRONTEND__|$IMAGE_FRONTEND|g" -e "s|__IMAGE_APM__|$IMAGE_APM|g" applications.yaml | kubectl -n neurons apply -f -
 ```
 
-Wait until the 6 applications are ready:
+Wait until the applications are ready:
 
 ```bash
-kubectl -n neurons wait --for=condition=available deployment --all --timeout=300s
+kubectl -n neurons wait --for=condition=available deployment --all --timeout=600s
 ```
 
-## Step 10 — Check that Neurons is running {#verifier}
+Each application starts with **1 pod**. The autoscalers add pods when CPU usage goes above 70 %: apm-ingest up to 4, apm-query, backend and frontend up to 3.
+
+## Step 11 — Check that Neurons is running {#verifier}
 
 The pods:
 
@@ -295,7 +398,7 @@ The pods:
 kubectl -n neurons get pods
 ```
 
-Expected: the 6 applications and `postgres-0` in `Running`.
+Expected in `Running`: the 13 applications (`apm-ingest`, `apm-query`, `apm-loader`, `apm-worker`, `apm-worker-families`, `apm-trace-graph-worker`, `apm-canonicalization-worker`, `platform-health-checker`, `neurons-automation`, `neurones-backend`, `neurones-backend-jobs`, `neurones-frontend`, `neurones-redis`), `postgres-0`, and the Kafka pods (`neurons-kafka-dual-role-0`, `neurons-kafka-entity-operator`, `strimzi-cluster-operator`). The two migration jobs are `Completed`.
 
 The web routes:
 
@@ -303,14 +406,14 @@ The web routes:
 kubectl -n neurons get ingress
 ```
 
-Expected: an address in the `ADDRESS` column.
+Expected: the 6 routes, on your domain and your IngressClass.
 
-If the `ADDRESS` column is still empty, or if one of the following checks returns `503`, the routes are not active yet: wait a minute, then run it again.
+If one of the following checks returns `503` or `404`, the routes are not active yet: wait a minute, then run it again.
 
 The home page:
 
 ```bash
-curl -k -s -o /dev/null -w '%{http_code}\n' "https://$DOMAINE/"
+curl -k -s -o /dev/null -w '%{http_code}\n' "$ADRESSE/"
 ```
 
 Expected: `200`.
@@ -318,7 +421,7 @@ Expected: `200`.
 The administration API, without logging in:
 
 ```bash
-curl -k -s -o /dev/null -w '%{http_code}\n' "https://$DOMAINE/api/admin/databases/connected"
+curl -k -s -o /dev/null -w '%{http_code}\n' "$ADRESSE/api/admin/databases/connected"
 ```
 
 Expected: `401` (closed).
@@ -326,14 +429,14 @@ Expected: `401` (closed).
 Trace reception, without a token:
 
 ```bash
-curl -k -s -o /dev/null -w '%{http_code}\n' -X POST "https://$DOMAINE/v1/traces"
+curl -k -s -o /dev/null -w '%{http_code}\n' -X POST "$ADRESSE/v1/traces"
 ```
 
 Expected: `401` (closed).
 
-Finally, open `https://<your domain>` and log in with the administrator from step 8.
+Finally, open the Neurons address (`echo "$ADRESSE"`) and log in with the administrator from step 8.
 
-## Step 11 — Connect the OpenTelemetry collectors {#collecteurs}
+## Step 12 — Connect the OpenTelemetry collectors {#collecteurs}
 
 The ingestion token (keep it secret):
 
@@ -341,13 +444,14 @@ The ingestion token (keep it secret):
 echo "$JETON"
 ```
 
-Add this exporter to your collectors' configuration, then restart them:
+Add this exporter to your collectors' configuration, then restart them. The endpoint is the Neurons address (with its port if it is not 443):
 
 ```yaml
 exporters:
   otlphttp/neurones:
     endpoint: https://<your domain>
     encoding: json                 # required: Neurons only reads JSON
+    compression: none              # required: Neurons does not read gzip (the collector's default)
     headers:
       X-Neurones-Token: <ingestion token>
 ```
