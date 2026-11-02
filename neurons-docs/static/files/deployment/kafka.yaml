@@ -1,0 +1,83 @@
+# Neurons Kafka cluster (1 KRaft broker, 50 Gi on the default StorageClass)
+# and its 2 topics. Data is kept 24 hours.
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaNodePool
+metadata:
+  name: dual-role
+  labels:
+    strimzi.io/cluster: neurons-kafka
+spec:
+  replicas: 1
+  roles:
+  - controller
+  - broker
+  storage:
+    type: jbod
+    volumes:
+    - id: 0
+      type: persistent-claim
+      size: 50Gi
+      deleteClaim: false
+      kraftMetadata: shared
+  resources:
+    requests:
+      cpu: 500m
+      memory: 2Gi
+    limits:
+      memory: 2Gi
+  jvmOptions:
+    -Xms: 1024m
+    -Xmx: 1024m
+---
+apiVersion: kafka.strimzi.io/v1
+kind: Kafka
+metadata:
+  name: neurons-kafka
+spec:
+  kafka:
+    version: 4.3.1
+    listeners:
+    - name: plain
+      port: 9092
+      type: internal
+      tls: false
+    config:
+      offsets.topic.replication.factor: 1
+      transaction.state.log.replication.factor: 1
+      transaction.state.log.min.isr: 1
+      default.replication.factor: 1
+      min.insync.replicas: 1
+      auto.create.topics.enable: false
+      message.max.bytes: 16777216
+      replica.fetch.max.bytes: 16777216
+      log.retention.hours: 24
+  entityOperator:
+    topicOperator: {}
+---
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: otlp.traces.raw
+  labels:
+    strimzi.io/cluster: neurons-kafka
+spec:
+  partitions: 6
+  replicas: 1
+  config:
+    retention.ms: 86400000
+    max.message.bytes: 16777216
+    compression.type: producer
+---
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: otlp.logs.raw
+  labels:
+    strimzi.io/cluster: neurons-kafka
+spec:
+  partitions: 3
+  replicas: 1
+  config:
+    retention.ms: 86400000
+    max.message.bytes: 16777216
+    compression.type: producer

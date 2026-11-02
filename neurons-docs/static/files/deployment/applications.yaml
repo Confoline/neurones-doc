@@ -1,11 +1,940 @@
-# Neurons -- les 6 applications et leurs 6 routes web (Ingress, ingress-nginx).
-# Les reperes __...__ sont remplaces par le guide (sed) au moment du deploiement.
+# Neurons -- the applications (13 services), their web routes and autoscalers.
+# Generated from the neurones-installer template (same versions as production).
+# The __...__ markers are replaced by the deployment guide (sed).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: apm-vertica-config
+data:
+  VERTICA_HOST: __VERTICA_HOST__
+  VERTICA_PORT: '5433'
+  VERTICA_DB: __VERTICA_DB__
+  VERTICA_USER: neurones_writer
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: apm-app-config
+data:
+  POSTGRES_SERVER: postgres
+  POSTGRES_PORT: '5432'
+  JOB_LOCK_ENABLED: 'true'
+  KAFKA_BOOTSTRAP_SERVERS: neurons-kafka-kafka-bootstrap:9092
+  FLUSH_INTERVAL_S: '2'
+  SPAN_PROMOTED_ATTRS_READ: 'false'
+  SPANS_SKIP_RUM_EVENTS: ''
+  ROLLUP_AGG_THRESHOLD_MIN: '120'
+  PREAGG_SERIES_READ: 'true'
+  PREAGG_SERIES_RETENTION_HOURS: '72'
+  PREAGG_RUM_PAGE_LOAD_FROM_PARTIALS: 'true'
+  QUERY_RESPONSE_CACHE: 'true'
+  QUERY_RESPONSE_CACHE_TTL_S: '10'
+  QUERY_BULKHEADS: logs:^/logs$:3;servicemap:service-map:3;traces:^/traces$:4
+  QUERY_BULKHEAD_WAIT_S: '30'
+  LOGS_FIRST_SLICE_SEC: '30'
+  LOGS_REFRESH_LATE_HORIZON_MIN: '15'
+  LOGS_REQUEST_BUDGET_S: '20'
+  VISUAL_ATTRS_LOOKBACK_H: '24'
+  VISUAL_ATTRS_CACHE_S: '300'
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: apm-ingest
+spec:
+  strategy:
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app: apm-ingest
+  template:
+    metadata:
+      labels:
+        app: apm-ingest
+    spec:
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: apm-ingest
+      imagePullSecrets:
+      - name: neurones-registry
+      terminationGracePeriodSeconds: 120
+      containers:
+      - name: ingest
+        image: __IMAGE_APM__
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: http
+          containerPort: 8000
+        envFrom:
+        - configMapRef:
+            name: apm-vertica-config
+        - configMapRef:
+            name: apm-app-config
+        - secretRef:
+            name: postgres-secret
+        - secretRef:
+            name: apm-secret
+        env:
+        - name: APM_ROLE
+          value: ingest
+        - name: INGEST_MODE
+          value: kafka
+        lifecycle:
+          preStop:
+            exec:
+              command:
+              - sh
+              - -c
+              - sleep 15
+        startupProbe:
+          httpGet:
+            path: /metrics
+            port: http
+          periodSeconds: 10
+          failureThreshold: 30
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: http
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /metrics
+            port: http
+          periodSeconds: 20
+          timeoutSeconds: 5
+          failureThreshold: 3
+        resources:
+          requests:
+            cpu: 500m
+            memory: 768Mi
+          limits:
+            memory: 1536Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: apm-ingest
+spec:
+  type: ClusterIP
+  selector:
+    app: apm-ingest
+  ports:
+  - name: http
+    port: 8000
+    targetPort: http
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: apm-ingest
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: apm-ingest
+  minReplicas: 1
+  maxReplicas: 4
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: apm-ingest
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: apm-ingest
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: apm-query
+spec:
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: apm-query
+  template:
+    metadata:
+      labels:
+        app: apm-query
+    spec:
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: apm-query
+      imagePullSecrets:
+      - name: neurones-registry
+      containers:
+      - name: query
+        image: __IMAGE_APM__
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: http
+          containerPort: 8000
+        envFrom:
+        - configMapRef:
+            name: apm-vertica-config
+        - configMapRef:
+            name: apm-app-config
+        - secretRef:
+            name: postgres-secret
+        - secretRef:
+            name: apm-secret
+        env:
+        - name: APM_ROLE
+          value: query
+        - name: ROLLUP_LIVE_ENABLED
+          value: 'true'
+        - name: ROLLUP_LIVE_MAX_MINUTES
+          value: '60'
+        - name: VERTICA_QUERY_RESOURCE_POOL
+          value: apm_query_pool
+        - name: VERTICA_QUERY_RUNTIMECAP
+          value: 60 seconds
+        - name: TROUBLESHOOT_ROLLUP_WINDOW_MIN
+          value: '60'
+        lifecycle:
+          preStop:
+            exec:
+              command:
+              - sh
+              - -c
+              - sleep 10
+        startupProbe:
+          httpGet:
+            path: /metrics
+            port: http
+          periodSeconds: 10
+          failureThreshold: 30
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: http
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /metrics
+            port: http
+          periodSeconds: 20
+          timeoutSeconds: 5
+          failureThreshold: 3
+        resources:
+          requests:
+            cpu: 250m
+            memory: 512Mi
+          limits:
+            memory: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: apm-query
+spec:
+  type: ClusterIP
+  selector:
+    app: apm-query
+  ports:
+  - name: http
+    port: 8000
+    targetPort: http
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: apm-query
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: apm-query
+  minReplicas: 1
+  maxReplicas: 3
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: apm-query
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: apm-query
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: apm-loader
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: apm-loader
+  template:
+    metadata:
+      labels:
+        app: apm-loader
+    spec:
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: apm-loader
+      imagePullSecrets:
+      - name: neurones-registry
+      terminationGracePeriodSeconds: 60
+      containers:
+      - name: loader
+        image: __IMAGE_APM__
+        imagePullPolicy: IfNotPresent
+        command:
+        - python
+        - kafka_loader.py
+        envFrom:
+        - configMapRef:
+            name: apm-vertica-config
+        - configMapRef:
+            name: apm-app-config
+        - secretRef:
+            name: postgres-secret
+        - secretRef:
+            name: apm-secret
+        env:
+        - name: KAFKA_LOADER_GROUP
+          value: apm-vertica-loader
+        - name: LOADER_BATCH_ROWS
+          value: '50000'
+        - name: LOADER_FLUSH_INTERVAL_S
+          value: '10'
+        - name: VERTICA_RESOURCE_POOL
+          value: apm_loader_pool
+        - name: PREAGG_ENABLED
+          value: 'true'
+        - name: PREAGG_TRACES_ENABLED
+          value: 'true'
+        - name: PREAGG_RUM_CALLS_ENABLED
+          value: 'true'
+        - name: PREAGG_DB_CALLS_ENABLED
+          value: 'true'
+        - name: PREAGG_LOG_COUNTS_ENABLED
+          value: 'true'
+        - name: PREAGG_RUM_PAGE_LOAD_ENABLED
+          value: 'true'
+        - name: PREAGG_SERVICE_VERSIONS_ENABLED
+          value: 'true'
+        livenessProbe:
+          exec:
+            command:
+            - sh
+            - -c
+            - test -n "$(find /tmp/loader-alive -mmin -5 2>/dev/null)"
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          failureThreshold: 3
+        resources:
+          requests:
+            cpu: 500m
+            memory: 512Mi
+          limits:
+            memory: 1Gi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: apm-loader
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: apm-loader
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: apm-worker-config
+data:
+  APM_EVENT_SERVICE_ERROR_RATE_THRESHOLD: '0.2'
+  APM_EVENT_SERVICE_LATENCY_THRESHOLD_MS: '1500'
+  APM_EVENT_SERVICE_MIN_REQUESTS: '10'
+  BACKFILL_MINUTES: '15'
+  MAX_CATCHUP: '180'
+  ROLLUP_PARALLELISM: '2'
+  RUM_HIST_CATCHUP_TIME_BUDGET_SECONDS: '60'
+  SETTLE_SECONDS: '10'
+  TRACE_SUMMARY_BACKFILL_MINUTES: '43200'
+  TRACE_SUMMARY_MAX_CATCHUP: '50000'
+  TROUBLESHOOT_5M_BACKFILL_BUCKETS: '8640'
+  TROUBLESHOOT_5M_MAX_CATCHUP: '10000'
+  TROUBLESHOOT_ERR_1H_BACKFILL_BUCKETS: '720'
+  TROUBLESHOOT_ERR_1H_MAX_CATCHUP: '1000'
+  TROUBLESHOOT_ERR_5M_BACKFILL_BUCKETS: '8640'
+  TROUBLESHOOT_ERR_5M_MAX_CATCHUP: '10000'
+  VERTICA_SOCKET_TIMEOUT: '180'
+  PREAGG_METRICS_FROM_PARTIALS: 'true'
+  PREAGG_CUTOVER_GRACE_MINUTES: '10'
+  PREAGG_RECOMPUTE_MINUTES: '2'
+  PREAGG_RETENTION_HOURS: '48'
+  PREAGG_TRACE_SUMMARY_FROM_PARTIALS: 'true'
+  PREAGG_RUM_CALLS_FROM_PARTIALS: 'true'
+  BACKFILL_ADAPTIVE: 'true'
+  BACKFILL_TICK_BUDGET_MIN_SECONDS: '10'
+  BACKFILL_TICK_BUDGET_MAX_SECONDS: '45'
+  TROUBLESHOOT_FROM_TRACE_SUMMARY: 'true'
+  TRACE_JOIN_LOOKBACK_MINUTES: '2'
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: apm-worker
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: apm-worker
+  template:
+    metadata:
+      labels:
+        app: apm-worker
+    spec:
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: apm-worker
+      imagePullSecrets:
+      - name: neurones-registry
+      containers:
+      - name: worker
+        image: __IMAGE_APM__
+        imagePullPolicy: IfNotPresent
+        command:
+        - python
+        - worker.py
+        env:
+        - name: WORKER_ROLE
+          value: core
+        - name: VERTICA_RESOURCE_POOL
+          value: apm_core_pool
+        - name: VERTICA_QUERY_RESOURCE_POOL
+          value: apm_core_pool
+        - name: VERTICA_SOCKET_TIMEOUT
+          value: '300'
+        envFrom:
+        - configMapRef:
+            name: apm-vertica-config
+        - configMapRef:
+            name: apm-app-config
+        - configMapRef:
+            name: apm-worker-config
+        - secretRef:
+            name: postgres-secret
+        - secretRef:
+            name: apm-secret
+        resources:
+          requests:
+            cpu: 200m
+            memory: 512Mi
+          limits:
+            memory: 2Gi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: apm-worker
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: apm-worker
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: apm-worker-families
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: apm-worker-families
+  template:
+    metadata:
+      labels:
+        app: apm-worker-families
+    spec:
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: apm-worker-families
+      imagePullSecrets:
+      - name: neurones-registry
+      containers:
+      - name: worker
+        image: __IMAGE_APM__
+        imagePullPolicy: IfNotPresent
+        command:
+        - python
+        - worker.py
+        env:
+        - name: WORKER_ROLE
+          value: families
+        - name: VERTICA_RESOURCE_POOL
+          value: apm_worker_pool
+        - name: VERTICA_SOCKET_TIMEOUT
+          value: '1920'
+        - name: FAMILY_RUNTIMECAP
+          value: ''
+        - name: RUM_BACKEND_CALLS_1H_FROM_5M
+          value: 'true'
+        envFrom:
+        - configMapRef:
+            name: apm-vertica-config
+        - configMapRef:
+            name: apm-app-config
+        - configMapRef:
+            name: apm-worker-config
+        - secretRef:
+            name: postgres-secret
+        - secretRef:
+            name: apm-secret
+        resources:
+          requests:
+            cpu: 200m
+            memory: 512Mi
+          limits:
+            memory: 2Gi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: apm-worker-families
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: apm-worker-families
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: apm-trace-graph-config
+data:
+  TRACE_GRAPH_BACKFILL_MINUTES: '5'
+  TRACE_GRAPH_INTERVAL_MIN: '1'
+  TRACE_GRAPH_MAX_CATCHUP: '15'
+  TRACE_GRAPH_SETTLE_SECONDS: '30'
+  VERTICA_SOCKET_TIMEOUT: '180'
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: apm-trace-graph-worker
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: apm-trace-graph-worker
+  template:
+    metadata:
+      labels:
+        app: apm-trace-graph-worker
+    spec:
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: apm-trace-graph-worker
+      imagePullSecrets:
+      - name: neurones-registry
+      containers:
+      - name: trace-graph
+        image: __IMAGE_APM__
+        imagePullPolicy: IfNotPresent
+        command:
+        - python
+        - trace_graph_worker.py
+        envFrom:
+        - configMapRef:
+            name: apm-vertica-config
+        - configMapRef:
+            name: apm-trace-graph-config
+        env:
+        - name: VERTICA_RESOURCE_POOL
+          value: apm_worker_pool
+        - name: VERTICA_SOCKET_TIMEOUT
+          value: '1920'
+        - name: POSTGRES_SERVER
+          valueFrom:
+            configMapKeyRef:
+              name: apm-app-config
+              key: POSTGRES_SERVER
+        - name: POSTGRES_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: apm-app-config
+              key: POSTGRES_PORT
+        - name: JOB_LOCK_ENABLED
+          value: 'true'
+        - name: POSTGRES_DB
+          valueFrom:
+            secretKeyRef:
+              name: postgres-secret
+              key: POSTGRES_DB
+        - name: POSTGRES_USER
+          valueFrom:
+            secretKeyRef:
+              name: postgres-secret
+              key: POSTGRES_USER
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-secret
+              key: POSTGRES_PASSWORD
+        - name: VERTICA_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: apm-secret
+              key: VERTICA_PASSWORD
+        - name: NEURONES_INGEST_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: apm-secret
+              key: NEURONES_INGEST_TOKEN
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            memory: 512Mi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: apm-trace-graph-worker
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: apm-trace-graph-worker
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: apm-canonicalization-worker
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: apm-canonicalization-worker
+  template:
+    metadata:
+      labels:
+        app: apm-canonicalization-worker
+    spec:
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: apm-canonicalization-worker
+      imagePullSecrets:
+      - name: neurones-registry
+      containers:
+      - name: canonicalization
+        image: __IMAGE_APM__
+        imagePullPolicy: IfNotPresent
+        command:
+        - python
+        - apm_canonicalization_worker.py
+        envFrom:
+        - configMapRef:
+            name: apm-vertica-config
+        - configMapRef:
+            name: apm-app-config
+        - secretRef:
+            name: postgres-secret
+        - secretRef:
+            name: apm-secret
+        env:
+        - name: VERTICA_RESOURCE_POOL
+          value: apm_worker_pool
+        - name: VERTICA_SOCKET_TIMEOUT
+          value: '1920'
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            memory: 512Mi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: apm-canonicalization-worker
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: apm-canonicalization-worker
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: platform-health-checker
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: platform-health-checker
+  template:
+    metadata:
+      labels:
+        app: platform-health-checker
+    spec:
+      imagePullSecrets:
+      - name: neurones-registry
+      containers:
+      - name: checker
+        image: __IMAGE_APM__
+        imagePullPolicy: IfNotPresent
+        command:
+        - python
+        - -m
+        - platform_health
+        envFrom:
+        - configMapRef:
+            name: apm-vertica-config
+        - configMapRef:
+            name: apm-app-config
+        - secretRef:
+            name: postgres-secret
+        - secretRef:
+            name: apm-secret
+        env:
+        - name: PLATFORM_HEALTH_FRONTEND_URL
+          value: http://neurones-frontend:3000/
+        - name: PLATFORM_HEALTH_BACKEND_URL
+          value: http://neurones-api:8000
+        - name: PLATFORM_HEALTH_QUERY_API_URL
+          value: http://apm-query:8000
+        - name: PLATFORM_HEALTH_INTERVAL_S
+          value: '60'
+        - name: PLATFORM_HEALTH_VERTICA_MIRROR
+          value: 'false'
+        - name: PLATFORM_HEALTH_AUTOMATION_CHECK
+          value: 'true'
+        - name: PLATFORM_HEALTH_DATA_FRESHNESS
+          value: 'true'
+        livenessProbe:
+          exec:
+            command:
+            - python
+            - -c
+            - import os,sys,time; sys.exit(0 if time.time()-os.path.getmtime('/tmp/platform_health.heartbeat')<180 else 1)
+          initialDelaySeconds: 90
+          periodSeconds: 60
+          failureThreshold: 2
+        resources:
+          requests:
+            cpu: 20m
+            memory: 96Mi
+          limits:
+            memory: 256Mi
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: neurons-automation
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: neurons-automation
+rules:
+- apiGroups:
+  - apps
+  resources:
+  - deployments
+  resourceNames:
+  - apm-ingest
+  - apm-query
+  - neurones-frontend
+  - neurones-backend
+  verbs:
+  - get
+  - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: neurons-automation
+subjects:
+- kind: ServiceAccount
+  name: neurons-automation
+  namespace: neurons
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: neurons-automation
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: neurons-automation
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: neurons-automation
+  template:
+    metadata:
+      labels:
+        app: neurons-automation
+    spec:
+      serviceAccountName: neurons-automation
+      imagePullSecrets:
+      - name: neurones-registry
+      containers:
+      - name: automation
+        image: __IMAGE_APM__
+        imagePullPolicy: IfNotPresent
+        command:
+        - python
+        - -m
+        - neurons_automation
+        envFrom:
+        - configMapRef:
+            name: apm-app-config
+        - secretRef:
+            name: postgres-secret
+        env:
+        - name: AUTOMATION_MODE
+          value: dry_run
+        - name: AUTOMATION_TEST_ACTIONS
+          value: 'false'
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        ports:
+        - name: health
+          containerPort: 8080
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: health
+          initialDelaySeconds: 60
+          periodSeconds: 60
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: health
+          periodSeconds: 30
+        resources:
+          requests:
+            cpu: 20m
+            memory: 96Mi
+          limits:
+            memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: neurons-automation
+spec:
+  type: ClusterIP
+  selector:
+    app: neurons-automation
+  ports:
+  - name: health
+    port: 8080
+    targetPort: health
+---
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: neurones-backend-config
 data:
   ENV: production
+  REDIS_URL: redis://neurones-redis:6379/0
   POSTGRES_SERVER: postgres
   POSTGRES_PORT: '5432'
   VERTICA_SERVER: __VERTICA_HOST__
@@ -13,13 +942,72 @@ data:
   VERTICA_DB: __VERTICA_DB__
   VERTICA_USER: neurones_reader
   VERTICA_MONITOR_ENABLED: '0'
-  ALLOWED_ORIGINS: https://__DOMAINE__
+  ALLOWED_ORIGINS: __ADRESSE__
   OTEL_ENABLED: 'false'
   OTEL_ENABLE_METRICS: 'false'
   OTEL_SERVICE_NAME: neurones-backend
   OTEL_SERVICE_NAMESPACE: neurones
   OTEL_SERVICE_VERSION: v1.6.13-otel3
   OTEL_DEPLOYMENT_ENV: client
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: neurones-redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: neurones-redis
+  template:
+    metadata:
+      labels:
+        app: neurones-redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:7.4-alpine
+        args:
+        - --save
+        - ''
+        - --appendonly
+        - 'no'
+        - --maxmemory
+        - 64mb
+        ports:
+        - name: redis
+          containerPort: 6379
+        readinessProbe:
+          exec:
+            command:
+            - redis-cli
+            - ping
+          periodSeconds: 10
+        livenessProbe:
+          tcpSocket:
+            port: redis
+          periodSeconds: 20
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            memory: 128Mi
+      imagePullSecrets:
+      - name: neurones-registry
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: neurones-redis
+spec:
+  type: ClusterIP
+  selector:
+    app: neurones-redis
+  ports:
+  - name: redis
+    port: 6379
+    targetPort: redis
 ---
 apiVersion: v1
 kind: Service
@@ -39,9 +1027,10 @@ kind: Deployment
 metadata:
   name: neurones-backend
 spec:
-  replicas: 1
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
   selector:
     matchLabels:
       app: neurones-backend
@@ -50,6 +1039,13 @@ spec:
       labels:
         app: neurones-backend
     spec:
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: neurones-backend
       imagePullSecrets:
       - name: neurones-registry
       containers:
@@ -66,6 +1062,11 @@ spec:
             name: postgres-secret
         - secretRef:
             name: neurones-backend-secret
+        env:
+        - name: CMDB_SYNC_SCHEDULER_ENABLED
+          value: '0'
+        - name: VERTICA_MONITOR_ENABLED
+          value: '0'
         startupProbe:
           httpGet:
             path: /health
@@ -93,6 +1094,93 @@ spec:
           limits:
             memory: 1Gi
 ---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: neurones-backend
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: neurones-backend
+  minReplicas: 1
+  maxReplicas: 3
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: neurones-backend
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: neurones-backend
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: neurones-backend-jobs
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: neurones-backend-jobs
+  template:
+    metadata:
+      labels:
+        app: neurones-backend-jobs
+    spec:
+      imagePullSecrets:
+      - name: neurones-registry
+      containers:
+      - name: backend-jobs
+        image: __IMAGE_BACKEND__
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: http
+          containerPort: 8000
+        envFrom:
+        - configMapRef:
+            name: neurones-backend-config
+        - secretRef:
+            name: postgres-secret
+        - secretRef:
+            name: neurones-backend-secret
+        env:
+        - name: CMDB_SYNC_SCHEDULER_ENABLED
+          value: '1'
+        startupProbe:
+          httpGet:
+            path: /health
+            port: http
+          periodSeconds: 10
+          failureThreshold: 30
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: http
+          periodSeconds: 20
+          timeoutSeconds: 5
+          failureThreshold: 3
+        resources:
+          requests:
+            cpu: 100m
+            memory: 512Mi
+          limits:
+            memory: 1Gi
+---
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -100,7 +1188,7 @@ metadata:
 data:
   NODE_ENV: production
   HOSTNAME: 0.0.0.0
-  APM_API_BASE: http://apm-ingest:8000/api
+  APM_API_BASE: http://apm-query:8000/api
   INTERNAL_API_URL: http://neurones-api:8000
 ---
 apiVersion: apps/v1
@@ -108,7 +1196,6 @@ kind: Deployment
 metadata:
   name: neurones-frontend
 spec:
-  replicas: 1
   strategy:
     rollingUpdate:
       maxUnavailable: 0
@@ -121,6 +1208,13 @@ spec:
       labels:
         app: neurones-frontend
     spec:
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: neurones-frontend
       imagePullSecrets:
       - name: neurones-registry
       containers:
@@ -162,6 +1256,38 @@ spec:
           limits:
             memory: 512Mi
 ---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: neurones-frontend
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: neurones-frontend
+  minReplicas: 1
+  maxReplicas: 3
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: neurones-frontend
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: neurones-frontend
+---
 apiVersion: v1
 kind: Service
 metadata:
@@ -175,275 +1301,6 @@ spec:
     port: 3000
     targetPort: http
 ---
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: apm-vertica-config
-data:
-  VERTICA_HOST: __VERTICA_HOST__
-  VERTICA_PORT: '5433'
-  VERTICA_DB: __VERTICA_DB__
-  VERTICA_USER: neurones_writer
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: apm-app-config
-data:
-  POSTGRES_SERVER: postgres
-  POSTGRES_PORT: '5432'
-  FLUSH_INTERVAL_S: '30'
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: apm-ingest
-spec:
-  replicas: 1
-  strategy:
-    rollingUpdate:
-      maxUnavailable: 0
-    type: RollingUpdate
-  selector:
-    matchLabels:
-      app: apm-ingest
-  template:
-    metadata:
-      labels:
-        app: apm-ingest
-    spec:
-      imagePullSecrets:
-      - name: neurones-registry
-      terminationGracePeriodSeconds: 120
-      containers:
-      - name: ingest
-        image: __IMAGE_APM__
-        imagePullPolicy: IfNotPresent
-        ports:
-        - name: http
-          containerPort: 8000
-        envFrom:
-        - configMapRef:
-            name: apm-vertica-config
-        - configMapRef:
-            name: apm-app-config
-        - secretRef:
-            name: postgres-secret
-        - secretRef:
-            name: apm-secret
-        lifecycle:
-          preStop:
-            exec:
-              command:
-              - sh
-              - -c
-              - sleep 15
-        startupProbe:
-          httpGet:
-            path: /metrics
-            port: http
-          periodSeconds: 10
-          failureThreshold: 30
-        readinessProbe:
-          httpGet:
-            path: /health
-            port: http
-          periodSeconds: 10
-          timeoutSeconds: 3
-          failureThreshold: 3
-        livenessProbe:
-          httpGet:
-            path: /metrics
-            port: http
-          periodSeconds: 20
-          timeoutSeconds: 5
-          failureThreshold: 3
-        resources:
-          requests:
-            cpu: 200m
-            memory: 512Mi
-          limits:
-            memory: 1536Mi
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: apm-ingest
-spec:
-  type: ClusterIP
-  selector:
-    app: apm-ingest
-  ports:
-  - name: http
-    port: 8000
-    targetPort: http
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: apm-worker-config
-data:
-  APM_EVENT_SERVICE_ERROR_RATE_THRESHOLD: '0.2'
-  APM_EVENT_SERVICE_LATENCY_THRESHOLD_MS: '1500'
-  APM_EVENT_SERVICE_MIN_REQUESTS: '10'
-  BACKFILL_MINUTES: '15'
-  MAX_CATCHUP: '180'
-  ROLLUP_PARALLELISM: '1'
-  RUM_HIST_CATCHUP_TIME_BUDGET_SECONDS: '60'
-  SETTLE_SECONDS: '10'
-  TRACE_SUMMARY_BACKFILL_MINUTES: '43200'
-  TRACE_SUMMARY_MAX_CATCHUP: '50000'
-  TROUBLESHOOT_5M_BACKFILL_BUCKETS: '8640'
-  TROUBLESHOOT_5M_MAX_CATCHUP: '10000'
-  TROUBLESHOOT_ERR_1H_BACKFILL_BUCKETS: '720'
-  TROUBLESHOOT_ERR_1H_MAX_CATCHUP: '1000'
-  TROUBLESHOOT_ERR_5M_BACKFILL_BUCKETS: '8640'
-  TROUBLESHOOT_ERR_5M_MAX_CATCHUP: '10000'
-  VERTICA_SOCKET_TIMEOUT: '180'
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: apm-worker
-spec:
-  replicas: 1
-  strategy:
-    type: Recreate
-  selector:
-    matchLabels:
-      app: apm-worker
-  template:
-    metadata:
-      labels:
-        app: apm-worker
-    spec:
-      imagePullSecrets:
-      - name: neurones-registry
-      containers:
-      - name: worker
-        image: __IMAGE_APM__
-        imagePullPolicy: IfNotPresent
-        command:
-        - python
-        - worker.py
-        envFrom:
-        - configMapRef:
-            name: apm-vertica-config
-        - configMapRef:
-            name: apm-app-config
-        - configMapRef:
-            name: apm-worker-config
-        - secretRef:
-            name: postgres-secret
-        - secretRef:
-            name: apm-secret
-        resources:
-          requests:
-            cpu: 200m
-            memory: 512Mi
-          limits:
-            memory: 1Gi
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: apm-trace-graph-config
-data:
-  TRACE_GRAPH_BACKFILL_MINUTES: '5'
-  TRACE_GRAPH_INTERVAL_MIN: '1'
-  TRACE_GRAPH_MAX_CATCHUP: '15'
-  TRACE_GRAPH_SETTLE_SECONDS: '30'
-  VERTICA_SOCKET_TIMEOUT: '180'
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: apm-trace-graph-worker
-spec:
-  replicas: 1
-  strategy:
-    type: Recreate
-  selector:
-    matchLabels:
-      app: apm-trace-graph-worker
-  template:
-    metadata:
-      labels:
-        app: apm-trace-graph-worker
-    spec:
-      imagePullSecrets:
-      - name: neurones-registry
-      containers:
-      - name: trace-graph
-        image: __IMAGE_APM__
-        imagePullPolicy: IfNotPresent
-        command:
-        - python
-        - trace_graph_worker.py
-        envFrom:
-        - configMapRef:
-            name: apm-vertica-config
-        - configMapRef:
-            name: apm-trace-graph-config
-        env:
-        - name: VERTICA_PASSWORD
-          valueFrom:
-            secretKeyRef:
-              name: apm-secret
-              key: VERTICA_PASSWORD
-        - name: NEURONES_INGEST_TOKEN
-          valueFrom:
-            secretKeyRef:
-              name: apm-secret
-              key: NEURONES_INGEST_TOKEN
-        resources:
-          requests:
-            cpu: 100m
-            memory: 256Mi
-          limits:
-            memory: 512Mi
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: apm-canonicalization-worker
-spec:
-  replicas: 1
-  strategy:
-    type: Recreate
-  selector:
-    matchLabels:
-      app: apm-canonicalization-worker
-  template:
-    metadata:
-      labels:
-        app: apm-canonicalization-worker
-    spec:
-      imagePullSecrets:
-      - name: neurones-registry
-      containers:
-      - name: canonicalization
-        image: __IMAGE_APM__
-        imagePullPolicy: IfNotPresent
-        command:
-        - python
-        - apm_canonicalization_worker.py
-        envFrom:
-        - configMapRef:
-            name: apm-vertica-config
-        - configMapRef:
-            name: apm-app-config
-        - secretRef:
-            name: postgres-secret
-        - secretRef:
-            name: apm-secret
-        resources:
-          requests:
-            cpu: 100m
-            memory: 256Mi
-          limits:
-            memory: 512Mi
----
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -451,7 +1308,7 @@ metadata:
   annotations:
     nginx.ingress.kubernetes.io/proxy-body-size: 50m
 spec:
-  ingressClassName: nginx
+  ingressClassName: __INGRESS_CLASS__
   tls:
   - hosts:
     - __DOMAINE__
@@ -478,7 +1335,7 @@ metadata:
     nginx.ingress.kubernetes.io/proxy-connect-timeout: '60'
     nginx.ingress.kubernetes.io/proxy-body-size: 50m
 spec:
-  ingressClassName: nginx
+  ingressClassName: __INGRESS_CLASS__
   rules:
   - host: __DOMAINE__
     http:
@@ -499,7 +1356,7 @@ metadata:
     nginx.ingress.kubernetes.io/proxy-read-timeout: '3600'
     nginx.ingress.kubernetes.io/proxy-send-timeout: '3600'
 spec:
-  ingressClassName: nginx
+  ingressClassName: __INGRESS_CLASS__
   rules:
   - host: __DOMAINE__
     http:
@@ -519,7 +1376,7 @@ metadata:
   annotations:
     nginx.ingress.kubernetes.io/proxy-read-timeout: '60'
 spec:
-  ingressClassName: nginx
+  ingressClassName: __INGRESS_CLASS__
   rules:
   - host: __DOMAINE__
     http:
@@ -540,7 +1397,7 @@ metadata:
     nginx.ingress.kubernetes.io/use-regex: 'true'
     nginx.ingress.kubernetes.io/rewrite-target: /guide/index.html
 spec:
-  ingressClassName: nginx
+  ingressClassName: __INGRESS_CLASS__
   rules:
   - host: __DOMAINE__
     http:
@@ -560,7 +1417,7 @@ metadata:
   annotations:
     nginx.ingress.kubernetes.io/proxy-body-size: 16m
 spec:
-  ingressClassName: nginx
+  ingressClassName: __INGRESS_CLASS__
   rules:
   - host: __DOMAINE__
     http:

@@ -1,0 +1,33 @@
+# Neurons -- cree le schema apm et ses tables dans Vertica, avec l'outil de migration
+# de l'image apm-ingest (le meme qu'en production). L'historique est garde dans
+# apm.flyway_schema_history : relance, le Job n'applique que les migrations manquantes.
+# Il se connecte avec le compte administrateur, lu dans le Secret vertica-admin (cree
+# puis supprime par le guide). Les reperes __...__ sont remplaces par le guide (sed).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: neurones-vertica-migrations
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 1800
+  template:
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: neurones-registry
+      containers:
+        - name: schema-migrations
+          image: __IMAGE_APM__
+          command: [python, -m, schema_migrations, migrate, --adopt-existing]
+          env:
+            - {name: VERTICA_HOST, value: "__VERTICA_HOST__"}
+            - {name: VERTICA_PORT, value: "5433"}
+            - {name: VERTICA_DB, value: "__VERTICA_DB__"}
+            - {name: VERTICA_SCHEMA, value: apm}
+            - {name: VERTICA_ADMIN_USER, value: dbadmin}
+            - name: VERTICA_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: vertica-admin, key: VERTICA_ADMIN_PASSWORD}
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {memory: 512Mi}
