@@ -37,6 +37,34 @@ This screen, labeled "Browser Performance" in the interface, measures the real e
 - **Geographic and device breakdown** — browser, operating system, device, or geographic region.
 - **Correlation with business transactions** — the ability to see which backend business transactions are triggered by a given page, and vice versa.
 
+### Where RUM data is stored
+
+All RUM data is kept in the Vertica data warehouse, schema `apm`.
+
+**Raw data** — written by the ingestion service as browser events arrive:
+
+| Table | Content |
+|---|---|
+| `apm.rum_events` | Main RUM table: page views, web vitals, JavaScript errors, business events. One row per event, with `service_name`, `application`, `session_id`, `page_path`, `rum_kind`; all attributes (`biz.*`, `user.*`, browser, page…) in `span_attributes`. |
+| `apm.spans` | Browser API calls (`rum.kind = api-call`), stored with the backend spans so they link to the backend traces. |
+| `apm.rum_frustration_signals` | Rage clicks, dead clicks, clicks followed by an error. |
+| `apm.rum_session_replay_batches` | Session replay recordings (compressed batches per session). |
+
+**Pre-computed summaries (rollups)** — filled by the background workers so dashboards stay fast over long periods. Suffix: `_1m` per minute, `_5m` per 5 minutes, `_1h` per hour, `_1d` per day.
+
+| Table | Used for |
+|---|---|
+| `apm.rum_apps_rollup_1h / _1d` | List of websites, page views per application. |
+| `apm.rum_overview_rollup_1h / _1d` | Page load KPIs (load time, backend / frontend split). |
+| `apm.rum_page_load_hist_rollup_1m / _1h / _1d` | Page load time distribution (percentiles). |
+| `apm.rum_page_views_rollup_1h / _1d` | Page views per page. |
+| `apm.rum_vitals_rollup_1h / _1d` | Web Vitals (LCP, INP, CLS, FCP, TTFB). |
+| `apm.rum_vitals_hist_rollup_1m / _1h / _1d` | Web Vitals distributions. |
+| `apm.rum_errors_rollup_1h / _1d` | JavaScript errors. |
+| `apm.rum_page_errors_rollup_1h / _1d` | Errors per page. |
+| `apm.rum_backend_calls_rollup_5m / _1h / _1d` | Browser to API calls (frontend / backend breakdown). |
+| `apm.rum_spa_interaction_rollup_1h / _1d` | In-app navigation of single-page applications. |
+
 ## Troubleshoot {#troubleshoot}
 
 The "Troubleshoot" screen is a cross-cutting workspace for investigating an ongoing problem, organized into four tabs:
