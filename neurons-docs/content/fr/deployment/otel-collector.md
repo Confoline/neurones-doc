@@ -48,6 +48,9 @@ Deux façons de démarrer, selon le serveur :
 
 ## Les trois jetons {#tokens}
 
+[![Les trois jetons : jeton d'enregistrement, jeton d'agent, jeton d'ingestion](../../images/otel-collector/tokens.png)](../../images/otel-collector/tokens.png)
+*Les trois jetons et le scénario qui utilise chacun (schéma en anglais). Cliquez pour agrandir.*
+
 | Jeton | Créé par | Durée de vie | Où il va | Sert à |
 |---|---|---|---|---|
 | **Jeton d'enregistrement** (`nrt_…`) | Vous : *Add collector* → *Generate token* | 24 h, usage unique, lié à un nom de Collecteur | `REGISTER_TOKEN` dans les paramètres de l'agent | Premier enregistrement d'un Collecteur existant ([A](#scenario-a)) |
@@ -106,6 +109,9 @@ systemctl list-units | grep otel
 
 L'agent enregistre le Collecteur **avec la config qu'il trouve sur le serveur**. Cette config devient la version 1 dans Neurons ; rien n'est modifié ni redémarré.
 
+[![Séquence du scénario A : vous, Neurons, agent, Collecteur](../../images/otel-collector/scenario-a.png)](../../images/otel-collector/scenario-a.png)
+*Le scénario A étape par étape : installation, chaque minute, et quand vous modifiez la config (schéma en anglais). Cliquez pour agrandir.*
+
 **1. Dans Neurons :** Paramètres → OpenTelemetry Collectors → *Add collector* → *Install the agent on the server*. Saisissez le nom (`collector-<hostname>`) et l'environnement (`prod`, `stg`…), puis cliquez sur **Generate token**. Copiez le jeton : il n'est affiché qu'une fois.
 
 **2. Sur le serveur, téléchargez et installez l'agent :**
@@ -143,6 +149,9 @@ Première modification conseillée : dans *Edit*, ajoutez l'extension `health_ch
 {{< /callout >}}
 
 ## Scénario B : nouveau serveur, config préparée dans Neurons {#scenario-b}
+
+[![Séquence du scénario B : vous, Neurons, agent, Collecteur](../../images/otel-collector/scenario-b.png)](../../images/otel-collector/scenario-b.png)
+*Le scénario B étape par étape : config dans Neurons d'abord, puis le nouveau serveur (schéma en anglais). Cliquez pour agrandir.*
 
 **1. Dans Neurons :** *Add collector* → *Write the config here first*. Partez du modèle Neurons (traces et logs vers Neurons, `health_check`, `memory_limiter`), puis cliquez sur **Create**. Copiez le **jeton d'agent** affiché une seule fois.
 

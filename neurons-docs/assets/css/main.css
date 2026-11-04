@@ -121,6 +121,7 @@ main[tabindex="-1"]:focus{outline:none}
 .content h3{font-family:var(--brandfont);font-size:19px;line-height:1.35;font-weight:700;color:var(--heading);margin:28px 0 8px}
 .content h4{font-family:var(--brandfont);font-size:16.5px;line-height:1.4;font-weight:700;color:var(--heading);margin:24px 0 8px}
 .content p{margin:0 0 16px}
+.content p>a>img,.content p>img{display:block;width:100%;height:auto;border:1px solid #e5e7eb;border-radius:12px;margin:8px 0 6px}
 .content ul,.content ol{margin:0 0 18px;padding-left:24px}
 .content li{margin:4px 0}
 .content li::marker{color:var(--accent)}

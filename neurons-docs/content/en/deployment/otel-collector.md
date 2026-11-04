@@ -48,6 +48,9 @@ There are two ways to start, depending on the server:
 
 ## The three tokens {#tokens}
 
+[![The three tokens: registration token, agent token, ingest token](../../images/otel-collector/tokens.png)](../../images/otel-collector/tokens.png)
+*The three tokens and which scenario needs which. Click to enlarge.*
+
 | Token | Created by | Lifetime | Where it goes | Used for |
 |---|---|---|---|---|
 | **Registration token** (`nrt_…`) | You: *Add collector* → *Generate token* | 24 h, single use, bound to one collector name | `REGISTER_TOKEN` in the agent settings | First registration of an existing Collector ([A](#scenario-a)) |
@@ -106,6 +109,9 @@ systemctl list-units | grep otel
 
 The agent registers the Collector **with the config it finds on the server**. That config becomes version 1 in Neurons; nothing is changed or restarted.
 
+[![Scenario A sequence: You, Neurons, Agent, Collector](../../images/otel-collector/scenario-a.png)](../../images/otel-collector/scenario-a.png)
+*Scenario A step by step: setup, every minute, and when you change the config. Click to enlarge.*
+
 **1. In Neurons:** Settings → OpenTelemetry Collectors → *Add collector* → *Install the agent on the server*. Enter the name (`collector-<hostname>`) and the environment (`prod`, `stg`…), then click **Generate token**. Copy the token: it is shown only once.
 
 **2. On the server, download and install the agent:**
@@ -143,6 +149,9 @@ Recommended first change: in *Edit*, add the `health_check` extension (needed fo
 {{< /callout >}}
 
 ## Scenario B: new server, config prepared in Neurons {#scenario-b}
+
+[![Scenario B sequence: You, Neurons, Agent, Collector](../../images/otel-collector/scenario-b.png)](../../images/otel-collector/scenario-b.png)
+*Scenario B step by step: config in Neurons first, then the new server. Click to enlarge.*
 
 **1. In Neurons:** *Add collector* → *Write the config here first*. Start from the Neurons template (traces and logs to Neurons, `health_check`, `memory_limiter`), then click **Create**. Copy the **agent token** shown once.
 
