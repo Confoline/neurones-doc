@@ -15,6 +15,8 @@ Au-delà du monitoring applicatif proprement dit, Neurons couvre également les 
 
 L'écran « Logs » donne accès aux journaux applicatifs récents, filtrables par niveau de sévérité (info, warning, error, etc.) et par fenêtre de temps. Il est pensé pour être utilisé en complément des traces : une trace montre le déroulement d'une requête, les logs apportent le détail textuel que l'application a choisi d'écrire à un instant donné.
 
+Deux modes de recherche sont disponibles. **Basic search** combine une recherche texte avec les filtres de niveau et de service. **AQL query** accepte des requêtes structurées comme `level IN (ERROR, WARN) AND service = "checkout" AND NOT message CONTAINS "health"`, y compris sur les attributs des logs et des ressources (`attr.exception.type = *`), avec vérification pendant la saisie, autocomplétion et exemples. Le flux de logs, les compteurs et le graphique de volume reflètent toujours la requête exécutée. Voir [AQL pour les logs](reference/aql/).
+
 ## Événements (Events) {#events}
 
 L'« Observability Event Center » centralise tous les événements générés par la plateforme : dépassement de seuil sur un service, violation d'une règle de santé, etc. Chaque événement a une sévérité et suit un cycle de vie explicite :

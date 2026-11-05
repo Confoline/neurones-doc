@@ -19,7 +19,7 @@ Le service Neurons APM (`apm-ingest`) expose une seule API HTTP, qui joue deux r
 - **Ingestion** — le Collecteur OpenTelemetry envoie traces, logs et métriques vers `/v1/*` au format OTLP/HTTP JSON.
 - **Requêtage** — l'interface Neurons lit tout ce qu'elle affiche depuis `/api/*` : applications, services, traces, logs, RUM, transactions métier, événements, alerting, rétention, etc.
 
-L'API expose **164 opérations** : 143 endpoints distincts, plus 21 alias `/rum/*` des endpoints `/api/rum/*` (voir [Conventions](#api-conventions)).
+L'API expose **166 opérations** : 145 endpoints distincts, plus 21 alias `/rum/*` des endpoints `/api/rum/*` (voir [Conventions](#api-conventions)).
 
 Cette page est une vue d'ensemble. Le contrat de référence, toujours à jour — paramètres, corps de requête et schémas de réponse — est la documentation Swagger générée par le service lui-même.
 
@@ -106,6 +106,8 @@ Un jeton absent ou invalide renvoie **401**. Ne jamais placer un jeton dans une 
 |---|---|---|
 | GET | /api/logs | Recherche de logs, du plus récent au plus ancien, avec filtres service, trace, sévérité et texte. |
 | GET | /api/logs/metrics | Volume de logs dans le temps, par sévérité. |
+| POST | /api/logs/aql/validate | Vérifie une requête AQL sans l'exécuter (voir [AQL pour les logs](../aql/)). |
+| GET | /api/logs/aql/suggest | Autocomplétion AQL : noms de champs, ou valeurs d'un champ avec leurs comptages de logs. |
 {mono="2"}
 
 ## Base de données {#api-database}
